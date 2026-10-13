@@ -13,7 +13,7 @@ export interface AgentEvent {
   id: string;
   run_id: string;
   timestamp: number;
-  event_type: 'run_started' | 'state_changed' | 'message_added' | 'tool_called' | 'tool_result' | 'checkpoint_created' | 'error';
+  event_type: 'run_started' | 'state_changed' | 'message_added' | 'tool_called' | 'tool_result' | 'checkpoint_created' | 'error' | 'task_created' | 'task_status_changed';
   data: Record<string, unknown>;
 }
 

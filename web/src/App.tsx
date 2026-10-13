@@ -2,6 +2,7 @@ import { TaskInput } from './components/TaskInput';
 import { EventTimeline } from './components/EventTimeline';
 import { DiffViewer } from './components/DiffViewer';
 import { RunsList } from './components/RunsList';
+import { SubtaskDAG } from './components/SubtaskDAG';
 import { useStore } from './store';
 import './App.css';
 
@@ -30,6 +31,7 @@ function App() {
 
         <div className="main-content">
           <EventTimeline />
+          <SubtaskDAG />
           <DiffViewer />
         </div>
       </div>

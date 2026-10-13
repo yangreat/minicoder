@@ -73,21 +73,25 @@ graph TB
 ### 🖥️ Web 控制台
 
 ![MiniCoder Console](docs/images/console-screenshot.svg)
+*注：上图为 UI Mockup，展示控制台界面设计*
 
 MiniCoder 提供了一个现代化的 Web 控制台，使用 **React + TypeScript** 构建：
 
 **前端特性**：
 - ✨ **实时事件流**：通过 SSE 实时显示 LLM 推理和工具调用
 - 📝 **任务输入面板**：直观的任务创建界面，支持 Demo 模式
-- 🔍 **Monaco 代码查看器**：并排查看代码变更
+- 🔍 **Monaco 代码查看器**：并排查看代码变更，支持批准/回滚
 - 📊 **运行历史**：查看所有运行记录，支持恢复和回滚
+- 🌐 **子任务 DAG 可视化**：使用 React Flow 展示任务依赖关系图
 - 🎨 **Markdown 渲染**：代码高亮显示 LLM 消息
 - 🔄 **状态管理**：使用 Zustand 进行类型安全的状态管理
+- ✅ **批准/拒绝操作**：直接从界面批准更改或回滚到检查点
 
 **后端 API**：
 - 🚀 **FastAPI**：高性能异步 API 服务器
 - 📡 **SSE 流**：实时推送代理事件
 - 🔧 **RESTful 端点**：启动/恢复/中止运行、查看事件、管理检查点
+- 📦 **静态文件服务**：内置提供前端构建文件
 - 🐳 **可选 Docker**：安全的沙箱执行环境
 
 ### 🎯 核心设计决策
@@ -158,33 +162,36 @@ pip install -e ".[docker]"
 
 #### 使用 Web 控制台 🌐
 
-**启动后端服务器**：
+**启动完整系统（单命令）**：
 ```bash
+# 构建前端
+cd web && npm install && npm run build && cd ..
+
+# 启动服务器（自动提供前端）
 minicoder serve --host 0.0.0.0 --port 8000
+
+# 在浏览器中打开 http://localhost:8000
 ```
 
-**启动前端（开发模式）**：
+**开发模式（热重载）**：
 ```bash
-cd web
-npm run dev
-```
+# 终端 1: 启动后端
+minicoder serve --host 0.0.0.0 --port 8000
 
-然后在浏览器中打开 http://localhost:5173
+# 终端 2: 启动前端开发服务器
+cd web && npm run dev
+# 访问 http://localhost:5173
+```
 
 **Demo 模式**：勾选 "Demo Mode (Mock LLM)" 复选框即可无需 API key 运行完整演示。
 
-**生产部署**：
-```bash
-# 构建前端
-cd web
-npm run build
-
-# 服务静态文件（使用 FastAPI）
-cd ..
-minicoder serve --host 0.0.0.0 --port 8000
-```
-
-前端构建输出在 `web/dist/`，可以由任何静态文件服务器托管，或配置 FastAPI 提供服务。
+**功能演示**：
+- ✅ 在任务输入框中输入任务描述
+- ✅ 实时查看事件时间线和工具调用
+- ✅ 在 DAG 图中查看任务依赖关系
+- ✅ 在 Monaco Editor 中查看代码变更
+- ✅ 使用"Approve"或"Reject & Rollback"按钮管理更改
+- ✅ 从运行历史中恢复或回滚之前的运行
 
 #### 配置 API （CLI 和 Web 控制台）
 
@@ -373,12 +380,12 @@ ruff check src/minicoder tests --fix
 - [x] Git 检查点和回滚
 - [x] 任务调度和并行执行
 - [x] 单元测试和 CI
-- [x] FastAPI Web 服务器
+- [x] FastAPI Web 服务器（含静态文件服务）
 - [x] React + TypeScript Web 控制台
 - [x] SSE 实时事件流
-- [x] Monaco 代码查看器
+- [x] Monaco 代码查看器（带批准/回滚）
+- [x] 子任务 DAG 可视化（React Flow）
 - [ ] 基于 tree-sitter 的代码索引
-- [ ] 子任务 DAG 可视化（React Flow）
 - [ ] 多代理协作
 - [ ] SWE-bench Lite 完整评估
 
@@ -407,20 +414,26 @@ See the Mermaid diagram in the Chinese section above for the complete system arc
 
 ### 🖥️ Web Console
 
+![MiniCoder Console](docs/images/console-screenshot.svg)
+*Note: Screenshot is a UI mockup showing the console interface design*
+
 MiniCoder features a modern **React + TypeScript** web console with:
 
 **Frontend Features**:
 - ✨ **Real-time Event Streaming**: Live display of LLM reasoning and tool calls via SSE
 - 📝 **Task Input Panel**: Intuitive interface for creating tasks with Demo mode support
-- 🔍 **Monaco Diff Viewer**: Side-by-side code change visualization
+- 🔍 **Monaco Diff Viewer**: Side-by-side code changes with approve/reject actions
 - 📊 **Run History**: View all runs with resume and rollback actions
+- 🌐 **Subtask DAG Visualization**: React Flow dependency graph with per-node status
 - 🎨 **Markdown Rendering**: Syntax-highlighted LLM messages
 - 🔄 **State Management**: Type-safe state with Zustand
+- ✅ **Approve/Reject Actions**: Approve changes or rollback to checkpoints directly from UI
 
 **Backend API**:
 - 🚀 **FastAPI**: High-performance async API server
 - 📡 **SSE Streaming**: Real-time agent event push
 - 🔧 **RESTful Endpoints**: Start/resume/abort runs, view events, manage checkpoints
+- 📦 **Static File Serving**: Built-in serving of frontend build
 - 🐳 **Optional Docker**: Secure sandboxed execution
 
 ### 🎯 Design Decisions
@@ -491,33 +504,36 @@ pip install -e ".[docker]"
 
 #### Using the Web Console 🌐
 
-**Start the backend server**:
+**Start Complete System (One Command)**:
 ```bash
+# Build frontend
+cd web && npm install && npm run build && cd ..
+
+# Start server (automatically serves frontend)
 minicoder serve --host 0.0.0.0 --port 8000
+
+# Open http://localhost:8000 in browser
 ```
 
-**Start the frontend (development mode)**:
+**Development Mode (Hot Reload)**:
 ```bash
-cd web
-npm run dev
-```
+# Terminal 1: Start backend
+minicoder serve --host 0.0.0.0 --port 8000
 
-Then open http://localhost:5173 in your browser.
+# Terminal 2: Start frontend dev server
+cd web && npm run dev
+# Visit http://localhost:5173
+```
 
 **Demo Mode**: Check the "Demo Mode (Mock LLM)" checkbox to run the full demo without an API key.
 
-**Production Deployment**:
-```bash
-# Build frontend
-cd web
-npm run build
-
-# Serve static files (with FastAPI)
-cd ..
-minicoder serve --host 0.0.0.0 --port 8000
-```
-
-Frontend build output is in `web/dist/` and can be served by any static file server or configured with FastAPI.
+**Feature Demo**:
+- ✅ Enter task description in the input panel
+- ✅ Watch real-time event timeline and tool calls
+- ✅ View task dependencies in the DAG graph
+- ✅ Review code changes in Monaco Editor
+- ✅ Use "Approve" or "Reject & Rollback" buttons to manage changes
+- ✅ Resume or rollback previous runs from history
 
 #### API Configuration (CLI and Web Console)
 
@@ -706,12 +722,12 @@ To generate actual results:
 - [x] Git checkpoints and rollback
 - [x] Task scheduling and parallel execution
 - [x] Unit tests and CI
-- [x] FastAPI web server
+- [x] FastAPI web server (with static file serving)
 - [x] React + TypeScript web console
 - [x] SSE real-time event streaming
-- [x] Monaco code diff viewer
+- [x] Monaco code diff viewer (with approve/rollback)
+- [x] Subtask DAG visualization (React Flow)
 - [ ] Tree-sitter based code indexing
-- [ ] Subtask DAG visualization (React Flow)
 - [ ] Multi-agent collaboration
 - [ ] Full SWE-bench Lite evaluation
 

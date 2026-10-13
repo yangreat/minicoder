@@ -8,6 +8,8 @@ from uuid import uuid4
 
 from fastapi import FastAPI, HTTPException, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
+from fastapi.responses import FileResponse
 from pydantic import BaseModel
 from sse_starlette.sse import EventSourceResponse
 
@@ -405,6 +407,24 @@ async def abort_run(run_id: str) -> Dict[str, str]:
         active_agents.pop(run_id)
         return {"status": "aborted"}
     return {"status": "not_running"}
+
+
+# Mount static files for the web console
+web_dist = Path(__file__).parent.parent.parent / "web" / "dist"
+if web_dist.exists():
+    app.mount("/assets", StaticFiles(directory=str(web_dist / "assets")), name="assets")
+
+    @app.get("/{full_path:path}")
+    async def serve_frontend(full_path: str) -> FileResponse:
+        """Serve the frontend application."""
+        if full_path.startswith("api/"):
+            raise HTTPException(status_code=404)
+        
+        file_path = web_dist / full_path
+        if file_path.exists() and file_path.is_file():
+            return FileResponse(file_path)
+        
+        return FileResponse(web_dist / "index.html")
 
 
 if __name__ == "__main__":

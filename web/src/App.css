@@ -352,6 +352,89 @@ button:disabled {
   overflow-x: auto;
 }
 
+/* Subtask DAG */
+.subtask-dag {
+  background: var(--surface);
+  border-radius: 0.5rem;
+  overflow: hidden;
+  margin-bottom: 1rem;
+}
+
+.subtask-dag.empty {
+  padding: 2rem;
+  text-align: center;
+  color: var(--text-dim);
+}
+
+.dag-header {
+  padding: 1rem 1.5rem;
+  border-bottom: 1px solid var(--border);
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+}
+
+.dag-header h3 {
+  font-size: 1.125rem;
+}
+
+.legend {
+  display: flex;
+  gap: 1rem;
+  font-size: 0.875rem;
+}
+
+.legend-item {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+}
+
+.legend-dot {
+  width: 12px;
+  height: 12px;
+  border-radius: 50%;
+}
+
+/* Diff Viewer Actions */
+.diff-actions {
+  display: flex;
+  gap: 0.5rem;
+  align-items: center;
+}
+
+.checkpoint-select {
+  padding: 0.5rem;
+  background: var(--surface-light);
+  border: 1px solid var(--border);
+  border-radius: 0.25rem;
+  color: var(--text);
+  font-size: 0.875rem;
+  max-width: 300px;
+}
+
+.approve-btn,
+.reject-btn {
+  padding: 0.5rem 1rem;
+  font-size: 0.875rem;
+}
+
+.approve-btn {
+  background: var(--success);
+}
+
+.approve-btn:hover:not(:disabled) {
+  background: #059669;
+}
+
+.reject-btn {
+  background: var(--danger);
+}
+
+.reject-btn:hover:not(:disabled) {
+  background: #dc2626;
+}
+
 /* Diff Viewer */
 .diff-viewer {
   background: var(--surface);
@@ -368,6 +451,9 @@ button:disabled {
 .diff-header {
   padding: 1rem 1.5rem;
   border-bottom: 1px solid var(--border);
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
 }
 
 .diff-header h3 {
