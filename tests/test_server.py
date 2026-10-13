@@ -12,11 +12,11 @@ from minicoder.state import StateManager
 client = TestClient(app)
 
 
-def test_root():
-    """Test root endpoint."""
-    response = client.get("/")
+def test_api_version():
+    """Test API endpoint."""
+    response = client.get("/api/runs")
     assert response.status_code == 200
-    assert response.json()["message"] == "MiniCoder API"
+    assert isinstance(response.json(), list)
 
 
 def test_list_runs_empty(tmp_path: Path):
