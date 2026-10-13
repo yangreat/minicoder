@@ -7,7 +7,7 @@ on:
     branches: [ main ]
 
 jobs:
-  test:
+  backend-test:
     runs-on: ubuntu-latest
     strategy:
       matrix:
@@ -44,3 +44,34 @@ jobs:
       with:
         file: ./coverage.xml
         fail_ci_if_error: false
+
+  frontend-test:
+    runs-on: ubuntu-latest
+
+    steps:
+    - uses: actions/checkout@v3
+
+    - name: Set up Node.js
+      uses: actions/setup-node@v4
+      with:
+        node-version: '20'
+
+    - name: Install frontend dependencies
+      working-directory: ./web
+      run: npm install
+
+    - name: Run ESLint
+      working-directory: ./web
+      run: npm run lint
+
+    - name: Run type checking
+      working-directory: ./web
+      run: npm run typecheck
+
+    - name: Run tests
+      working-directory: ./web
+      run: npm run test
+
+    - name: Build frontend
+      working-directory: ./web
+      run: npm run build

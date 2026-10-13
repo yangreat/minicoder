@@ -237,5 +237,23 @@ def checkpoints(run_id: str, repo: str) -> None:
     console.print(table)
 
 
+@main.command()
+@click.option("--host", default="0.0.0.0", help="Server host")
+@click.option("--port", default=8000, type=int, help="Server port")
+@click.option("--reload", is_flag=True, help="Enable auto-reload for development")
+def serve(host: str, port: int, reload: bool) -> None:
+    """Start the web server."""
+    import uvicorn
+
+    console.print(f"[bold blue]Starting MiniCoder server on http://{host}:{port}[/bold blue]")
+
+    uvicorn.run(
+        "minicoder.server:app",
+        host=host,
+        port=port,
+        reload=reload,
+    )
+
+
 if __name__ == "__main__":
     main()

@@ -39,6 +39,11 @@ htmlcov/
 .minicoder/
 *.db
 
+# Frontend
+web/node_modules/
+web/dist/
+web/.vite/
+
 # OS
 .DS_Store
 Thumbs.db

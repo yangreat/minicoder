@@ -31,7 +31,10 @@ MiniCoder 是一个从零开始构建的编码代理（Coding Agent），展示�
 
 ```mermaid
 graph TB
+    WebUI[Web 控制台<br/>React + TypeScript] --> API[FastAPI 服务器]
     CLI[CLI 入口] --> Agent[核心代理循环]
+    API --> Agent
+    
     Agent --> LLM[LLM 客户端<br/>OpenAI 兼容 API]
     Agent --> Context[上下文管理器]
     Agent --> State[状态管理器]
@@ -55,12 +58,37 @@ graph TB
     Scheduler --> Parallel[并行执行]
     Agent --> Scheduler
     
+    API --> SSE[SSE 实时流]
+    WebUI --> SSE
+    
+    style WebUI fill:#e1ffe7
+    style API fill:#ffe1f5
     style Agent fill:#e1f5ff
     style State fill:#fff4e1
     style Context fill:#f0ffe1
     style Tools fill:#ffe1f5
     style Scheduler fill:#e1ffe7
 ```
+
+### 🖥️ Web 控制台
+
+![MiniCoder Console](docs/images/console-screenshot.svg)
+
+MiniCoder 提供了一个现代化的 Web 控制台，使用 **React + TypeScript** 构建：
+
+**前端特性**：
+- ✨ **实时事件流**：通过 SSE 实时显示 LLM 推理和工具调用
+- 📝 **任务输入面板**：直观的任务创建界面，支持 Demo 模式
+- 🔍 **Monaco 代码查看器**：并排查看代码变更
+- 📊 **运行历史**：查看所有运行记录，支持恢复和回滚
+- 🎨 **Markdown 渲染**：代码高亮显示 LLM 消息
+- 🔄 **状态管理**：使用 Zustand 进行类型安全的状态管理
+
+**后端 API**：
+- 🚀 **FastAPI**：高性能异步 API 服务器
+- 📡 **SSE 流**：实时推送代理事件
+- 🔧 **RESTful 端点**：启动/恢复/中止运行、查看事件、管理检查点
+- 🐳 **可选 Docker**：安全的沙箱执行环境
 
 ### 🎯 核心设计决策
 
@@ -116,14 +144,49 @@ graph TB
 git clone https://github.com/username/minicoder.git
 cd minicoder
 
-# 安装（开发模式）
+# 安装后端（开发模式）
 pip install -e ".[dev]"
+
+# 安装前端依赖
+cd web
+npm install
+cd ..
 
 # 可选：安装 Docker 支持
 pip install -e ".[docker]"
 ```
 
-#### 配置 API
+#### 使用 Web 控制台 🌐
+
+**启动后端服务器**：
+```bash
+minicoder serve --host 0.0.0.0 --port 8000
+```
+
+**启动前端（开发模式）**：
+```bash
+cd web
+npm run dev
+```
+
+然后在浏览器中打开 http://localhost:5173
+
+**Demo 模式**：勾选 "Demo Mode (Mock LLM)" 复选框即可无需 API key 运行完整演示。
+
+**生产部署**：
+```bash
+# 构建前端
+cd web
+npm run build
+
+# 服务静态文件（使用 FastAPI）
+cd ..
+minicoder serve --host 0.0.0.0 --port 8000
+```
+
+前端构建输出在 `web/dist/`，可以由任何静态文件服务器托管，或配置 FastAPI 提供服务。
+
+#### 配置 API （CLI 和 Web 控制台）
 
 **选项 1：使用阿里云通义千问（Qwen）DashScope**
 
@@ -155,7 +218,7 @@ export OPENAI_API_KEY="sk-your-openai-key"
 minicoder run "重构这段代码" --model gpt-4
 ```
 
-#### 基本使用
+#### 使用 CLI
 
 ```bash
 # 在当前目录运行任务
@@ -178,6 +241,9 @@ minicoder rollback <run_id> <checkpoint_sha>
 
 # 查看运行的检查点
 minicoder checkpoints <run_id>
+
+# 启动 Web 服务器
+minicoder serve --port 8000
 ```
 
 ### 🧪 评估
@@ -240,7 +306,7 @@ minicoder runs --limit 100
 
 ### 🧑‍💻 开发
 
-#### 运行测试
+#### 后端测试
 
 ```bash
 # 运行所有测试（使用 mock LLM，无需 API key）
@@ -251,6 +317,24 @@ pytest --cov=minicoder --cov-report=html
 
 # 运行特定测试
 pytest tests/test_agent.py -v
+```
+
+#### 前端测试
+
+```bash
+cd web
+
+# 运行测试
+npm run test
+
+# 类型检查
+npm run typecheck
+
+# Lint
+npm run lint
+
+# 构建
+npm run build
 ```
 
 #### 类型检查
@@ -289,10 +373,13 @@ ruff check src/minicoder tests --fix
 - [x] Git 检查点和回滚
 - [x] 任务调度和并行执行
 - [x] 单元测试和 CI
+- [x] FastAPI Web 服务器
+- [x] React + TypeScript Web 控制台
+- [x] SSE 实时事件流
+- [x] Monaco 代码查看器
 - [ ] 基于 tree-sitter 的代码索引
+- [ ] 子任务 DAG 可视化（React Flow）
 - [ ] 多代理协作
-- [ ] 流式响应和进度更新
-- [ ] Web UI 仪表板
 - [ ] SWE-bench Lite 完整评估
 
 ### 📄 许可证
@@ -316,7 +403,25 @@ Built without agent frameworks (LangChain/LlamaIndex) to showcase AI Agent engin
 
 ### 🏗️ Architecture
 
-See the Mermaid diagram above for the system architecture.
+See the Mermaid diagram in the Chinese section above for the complete system architecture including the Web layer.
+
+### 🖥️ Web Console
+
+MiniCoder features a modern **React + TypeScript** web console with:
+
+**Frontend Features**:
+- ✨ **Real-time Event Streaming**: Live display of LLM reasoning and tool calls via SSE
+- 📝 **Task Input Panel**: Intuitive interface for creating tasks with Demo mode support
+- 🔍 **Monaco Diff Viewer**: Side-by-side code change visualization
+- 📊 **Run History**: View all runs with resume and rollback actions
+- 🎨 **Markdown Rendering**: Syntax-highlighted LLM messages
+- 🔄 **State Management**: Type-safe state with Zustand
+
+**Backend API**:
+- 🚀 **FastAPI**: High-performance async API server
+- 📡 **SSE Streaming**: Real-time agent event push
+- 🔧 **RESTful Endpoints**: Start/resume/abort runs, view events, manage checkpoints
+- 🐳 **Optional Docker**: Secure sandboxed execution
 
 ### 🎯 Design Decisions
 
@@ -372,14 +477,49 @@ See the Mermaid diagram above for the system architecture.
 git clone https://github.com/username/minicoder.git
 cd minicoder
 
-# Install (development mode)
+# Install backend (development mode)
 pip install -e ".[dev]"
+
+# Install frontend dependencies
+cd web
+npm install
+cd ..
 
 # Optional: Install Docker support
 pip install -e ".[docker]"
 ```
 
-#### API Configuration
+#### Using the Web Console 🌐
+
+**Start the backend server**:
+```bash
+minicoder serve --host 0.0.0.0 --port 8000
+```
+
+**Start the frontend (development mode)**:
+```bash
+cd web
+npm run dev
+```
+
+Then open http://localhost:5173 in your browser.
+
+**Demo Mode**: Check the "Demo Mode (Mock LLM)" checkbox to run the full demo without an API key.
+
+**Production Deployment**:
+```bash
+# Build frontend
+cd web
+npm run build
+
+# Serve static files (with FastAPI)
+cd ..
+minicoder serve --host 0.0.0.0 --port 8000
+```
+
+Frontend build output is in `web/dist/` and can be served by any static file server or configured with FastAPI.
+
+#### API Configuration (CLI and Web Console)
 
 **Option 1: Alibaba Cloud Qwen DashScope**
 
@@ -411,7 +551,7 @@ export OPENAI_API_KEY="sk-your-openai-key"
 minicoder run "Refactor this code" --model gpt-4
 ```
 
-#### Basic Usage
+#### Using the CLI
 
 ```bash
 # Run task in current directory
@@ -434,6 +574,9 @@ minicoder rollback <run_id> <checkpoint_sha>
 
 # View checkpoints for a run
 minicoder checkpoints <run_id>
+
+# Start web server
+minicoder serve --port 8000
 ```
 
 ### 🧪 Evaluation
@@ -496,7 +639,7 @@ minicoder runs --limit 100
 
 ### 🧑‍💻 Development
 
-#### Run Tests
+#### Backend Tests
 
 ```bash
 # Run all tests (uses mock LLM, no API key needed)
@@ -507,6 +650,24 @@ pytest --cov=minicoder --cov-report=html
 
 # Run specific test
 pytest tests/test_agent.py -v
+```
+
+#### Frontend Tests
+
+```bash
+cd web
+
+# Run tests
+npm run test
+
+# Type checking
+npm run typecheck
+
+# Lint
+npm run lint
+
+# Build
+npm run build
 ```
 
 #### Type Checking
@@ -545,10 +706,13 @@ To generate actual results:
 - [x] Git checkpoints and rollback
 - [x] Task scheduling and parallel execution
 - [x] Unit tests and CI
+- [x] FastAPI web server
+- [x] React + TypeScript web console
+- [x] SSE real-time event streaming
+- [x] Monaco code diff viewer
 - [ ] Tree-sitter based code indexing
+- [ ] Subtask DAG visualization (React Flow)
 - [ ] Multi-agent collaboration
-- [ ] Streaming responses and progress updates
-- [ ] Web UI dashboard
 - [ ] Full SWE-bench Lite evaluation
 
 ### 📄 License

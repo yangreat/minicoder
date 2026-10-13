@@ -30,6 +30,10 @@ dependencies = [
     "pydantic>=2.0.0",
     "pyyaml>=6.0.0",
     "rich>=13.0.0",
+    "fastapi>=0.104.0",
+    "uvicorn>=0.24.0",
+    "python-multipart>=0.0.6",
+    "sse-starlette>=1.6.0",
 ]
 
 [project.optional-dependencies]
@@ -40,6 +44,7 @@ dev = [
     "mypy>=1.0.0",
     "black>=23.0.0",
     "ruff>=0.1.0",
+    "httpx>=0.25.0",
 ]
 docker = [
     "docker>=6.0.0",
