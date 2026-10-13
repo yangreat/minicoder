@@ -118,10 +118,6 @@ async def ensure_state_manager_initialized(manager: StateManager) -> None:
         await manager.initialize()
 
 
-@app.get("/")
-async def root() -> Dict[str, str]:
-    """Root endpoint."""
-    return {"message": "MiniCoder API", "version": "0.1.0"}
 
 
 @app.get("/api/runs", response_model=List[RunResponse])
