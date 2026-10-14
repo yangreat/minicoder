@@ -129,13 +129,15 @@ const EventItem: React.FC<{ event: AgentEvent }> = ({ event }) => {
           </div>
         );
 
-      case 'tool_called':
+      case 'tool_called': {
+        const agentId = event.data.agent_id ? ` [${String(event.data.agent_id)}]` : '';
         return (
           <div className="event-content tool-call">
-            <strong>Tool Called: {event.data.tool as string}</strong>
+            <strong>Tool Called: {event.data.tool as string}{agentId}</strong>
             <pre>{JSON.stringify(event.data.arguments, null, 2)}</pre>
           </div>
         );
+      }
 
       case 'tool_result':
         return (
@@ -171,12 +173,16 @@ const EventItem: React.FC<{ event: AgentEvent }> = ({ event }) => {
         );
       }
 
-      case 'task_status_changed':
+      case 'task_status_changed': {
+        const who = event.data.agent_id ? ` (${String(event.data.agent_id)})` : '';
+        const desc = event.data.description ? `: ${String(event.data.description)}` : '';
         return (
           <div className="event-content">
-            <strong>Subtask {String(event.data.new_status)}</strong>
+            <strong>Subtask {String(event.data.new_status)}{who}</strong>
+            {desc ? <p>{desc}</p> : null}
           </div>
         );
+      }
 
       default:
         return (

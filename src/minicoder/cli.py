@@ -25,11 +25,30 @@ def main() -> None:
 @main.command()
 @click.argument("task")
 @click.option("--repo", type=click.Path(exists=True), default=".", help="Repository path")
-@click.option("--model", default="gpt-4", help="LLM model to use")
+@click.option(
+    "--model",
+    default=lambda: os.getenv("OPENAI_MODEL") or os.getenv("EVAL_MODEL") or "gpt-4",
+    help="LLM model to use (or OPENAI_MODEL / EVAL_MODEL env)",
+)
 @click.option("--base-url", default=None, help="OpenAI-compatible API base URL")
 @click.option("--api-key", default=None, help="API key (or use OPENAI_API_KEY env var)")
 @click.option("--max-steps", default=30, type=int, help="Maximum execution steps")
 @click.option("--docker", is_flag=True, help="Use Docker sandbox for shell commands")
+@click.option(
+    "--mode",
+    type=click.Choice(["single", "multi"]),
+    default="single",
+    help="single agent loop or multi-agent (planner + concurrent sub-agents)",
+)
+@click.option("--max-parallel", default=3, type=int, help="Max concurrent sub-agents in multi mode")
+@click.option("--request-timeout", default=None, type=float, help="LLM request timeout in seconds")
+@click.option("--max-retries", default=None, type=int, help="LLM retries after the first attempt")
+@click.option(
+    "--protect-tests",
+    type=click.Choice(["off", "block", "flag"]),
+    default="off",
+    help="Guard edits to test files",
+)
 def run(
     task: str,
     repo: str,
@@ -38,9 +57,29 @@ def run(
     api_key: str | None,
     max_steps: int,
     docker: bool,
+    mode: str,
+    max_parallel: int,
+    request_timeout: float | None,
+    max_retries: int | None,
+    protect_tests: str,
 ) -> None:
     """Run the agent on a task."""
-    asyncio.run(_run_agent(task, repo, model, base_url, api_key, max_steps, docker))
+    asyncio.run(
+        _run_agent(
+            task,
+            repo,
+            model,
+            base_url,
+            api_key,
+            max_steps,
+            docker,
+            mode,
+            max_parallel,
+            request_timeout,
+            max_retries,
+            protect_tests,
+        )
+    )
 
 
 async def _run_agent(
@@ -51,6 +90,11 @@ async def _run_agent(
     api_key: str | None,
     max_steps: int,
     docker: bool,
+    mode: str = "single",
+    max_parallel: int = 3,
+    request_timeout: float | None = None,
+    max_retries: int | None = None,
+    protect_tests: str = "off",
 ) -> None:
     """Async implementation of run command."""
     repo_path = Path(repo).resolve()
@@ -73,6 +117,11 @@ async def _run_agent(
             model=model,
             max_steps=max_steps,
             use_docker=docker,
+            mode=mode,
+            max_parallel=max_parallel,
+            request_timeout=request_timeout,
+            max_retries=max_retries,
+            protect_tests=protect_tests,
         )
 
         result = await agent.run(task)
@@ -90,10 +139,20 @@ async def _run_agent(
 @main.command()
 @click.argument("run_id")
 @click.option("--repo", type=click.Path(exists=True), default=".", help="Repository path")
-@click.option("--model", default="gpt-4", help="LLM model to use")
+@click.option(
+    "--model",
+    default=lambda: os.getenv("OPENAI_MODEL") or os.getenv("EVAL_MODEL") or "gpt-4",
+    help="LLM model to use",
+)
 @click.option("--base-url", default=None, help="OpenAI-compatible API base URL")
 @click.option("--api-key", default=None, help="API key")
 @click.option("--max-steps", default=30, type=int, help="Maximum execution steps")
+@click.option(
+    "--mode",
+    type=click.Choice(["single", "multi"]),
+    default="single",
+    help="single or multi agent",
+)
 def resume(
     run_id: str,
     repo: str,
@@ -101,9 +160,10 @@ def resume(
     base_url: str | None,
     api_key: str | None,
     max_steps: int,
+    mode: str,
 ) -> None:
     """Resume a previous run."""
-    asyncio.run(_resume_agent(run_id, repo, model, base_url, api_key, max_steps))
+    asyncio.run(_resume_agent(run_id, repo, model, base_url, api_key, max_steps, mode))
 
 
 async def _resume_agent(
@@ -113,6 +173,7 @@ async def _resume_agent(
     base_url: str | None,
     api_key: str | None,
     max_steps: int,
+    mode: str = "single",
 ) -> None:
     """Async implementation of resume command."""
     repo_path = Path(repo).resolve()
@@ -131,6 +192,7 @@ async def _resume_agent(
             base_url=base_url or os.getenv("OPENAI_BASE_URL"),
             model=model,
             max_steps=max_steps,
+            mode=mode,
         )
 
         result = await agent.resume(run_id)

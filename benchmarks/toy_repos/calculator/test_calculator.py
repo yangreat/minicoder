@@ -1,4 +1,4 @@
-"""Tests for calculator - currently failing."""
+"""Tests for calculator - currently failing on divide-by-zero."""
 
 import pytest
 from calculator import calculator
@@ -21,6 +21,6 @@ def test_divide() -> None:
 
 
 def test_divide_by_zero() -> None:
-    """This test should pass but currently fails."""
-    with pytest.raises(ZeroDivisionError):
+    """Must raise ValueError (not ZeroDivisionError) when dividing by zero."""
+    with pytest.raises(ValueError, match="zero"):
         calculator(10, 0, "divide")

@@ -34,23 +34,29 @@ class StartRunRequest(BaseModel):
 
     task: str
     repo_path: str = "."
-    model: str = "gpt-4"
+    model: str | None = None
     base_url: str | None = None
     api_key: str | None = None
     max_steps: int = 30
     use_docker: bool = False
     use_mock: bool = False
+    mode: str = "single"
+    max_parallel: int = 3
+    request_timeout: float | None = None
+    max_retries: int | None = None
+    protect_tests: str = "off"
 
 
 class ResumeRunRequest(BaseModel):
     """Request to resume a run."""
 
     run_id: str
-    model: str = "gpt-4"
+    model: str | None = None
     base_url: str | None = None
     api_key: str | None = None
     max_steps: int = 30
     use_mock: bool = False
+    mode: str = "single"
 
 
 class RollbackRequest(BaseModel):
@@ -198,14 +204,22 @@ async def start_run(request: StartRunRequest, background_tasks: BackgroundTasks)
     await ensure_state_manager_initialized(manager)
     await manager.create_run(run_id, request.task, str(repo_path), AgentState.PLANNING)
 
+    agent_kwargs: dict[str, Any] = {
+        "model": request.model,
+        "max_steps": request.max_steps,
+        "use_docker": request.use_docker,
+        "mode": request.mode,
+        "max_parallel": request.max_parallel,
+        "request_timeout": request.request_timeout,
+        "max_retries": request.max_retries,
+        "protect_tests": request.protect_tests,
+    }
     if request.use_mock:
         agent = CodingAgent(
             repo_path,
             manager,
-            model=request.model,
-            max_steps=request.max_steps,
-            use_docker=request.use_docker,
             step_delay=0.35,
+            **agent_kwargs,
         )
         agent.client = build_demo_client(repo_path)
     else:
@@ -214,9 +228,7 @@ async def start_run(request: StartRunRequest, background_tasks: BackgroundTasks)
             manager,
             api_key=request.api_key,
             base_url=request.base_url,
-            model=request.model,
-            max_steps=request.max_steps,
-            use_docker=request.use_docker,
+            **agent_kwargs,
         )
 
     active_agents[run_id] = agent
@@ -306,6 +318,7 @@ async def resume_run(run_id: str, request: ResumeRunRequest, background_tasks: B
             model=request.model,
             max_steps=request.max_steps,
             step_delay=0.35,
+            mode=request.mode,
         )
         agent.client = build_demo_client(repo_path)
     else:
@@ -316,6 +329,7 @@ async def resume_run(run_id: str, request: ResumeRunRequest, background_tasks: B
             base_url=request.base_url,
             model=request.model,
             max_steps=request.max_steps,
+            mode=request.mode,
         )
 
     active_agents[run_id] = agent

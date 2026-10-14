@@ -10,7 +10,7 @@ from minicoder.mock_llm import MockOpenAI, MockResponse, MockToolCall
 
 CALCULATOR_RELATIVE = Path("benchmarks/toy_repos/calculator")
 
-ORIGINAL_CALCULATOR = '''"""Bug: Calculator returns wrong result for division by zero."""
+ORIGINAL_CALCULATOR = '''"""Bug: division by zero raises ZeroDivisionError instead of ValueError."""
 
 
 def calculator(a: float, b: float, operation: str) -> float:

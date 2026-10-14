@@ -125,7 +125,7 @@ export const SubtaskDAG: React.FC = () => {
   if (subtasks.size === 0) {
     return (
       <div className="subtask-dag empty">
-        <p>No subtasks available. Subtask decomposition coming soon.</p>
+        <p>No subtasks yet. The planner emits a dependency graph when a run starts.</p>
       </div>
     );
   }
@@ -150,6 +150,10 @@ export const SubtaskDAG: React.FC = () => {
           <span className="legend-item">
             <span className="legend-dot" style={{ background: '#ef4444' }}></span>
             Failed
+          </span>
+          <span className="legend-item">
+            <span className="legend-dot" style={{ background: '#f59e0b' }}></span>
+            Blocked
           </span>
         </div>
       </div>

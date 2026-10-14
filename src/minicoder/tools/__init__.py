@@ -1,14 +1,27 @@
 """Tools for the coding agent."""
 
 import asyncio
-import difflib
 import os
 import re
 import subprocess
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any
 
 from pydantic import BaseModel
+
+from minicoder.tools.guard import TestFileGuard
+from minicoder.tools.patch import PatchError, apply_patch_text
+
+
+def resolve_repo_path(repo_path: Path, path: str) -> Path:
+    """Resolve ``path`` inside ``repo_path``, rejecting escapes."""
+    full = (repo_path / path).resolve()
+    repo = repo_path.resolve()
+    try:
+        full.relative_to(repo)
+    except ValueError as exc:
+        raise ValueError(f"Path escapes repository root: {path}") from exc
+    return full
 
 
 class ToolResult(BaseModel):
@@ -38,7 +51,7 @@ class ReadFileTool:
     async def execute(self, path: str) -> ToolResult:
         """Execute the tool."""
         try:
-            file_path = self.repo_path / path
+            file_path = resolve_repo_path(self.repo_path, path)
             if not file_path.exists():
                 return ToolResult(success=False, output="", error=f"File not found: {path}")
 
@@ -62,16 +75,24 @@ class WriteFileTool:
         "required": ["path", "content"],
     }
 
-    def __init__(self, repo_path: Path):
+    def __init__(self, repo_path: Path, test_guard: TestFileGuard | None = None):
         self.repo_path = repo_path
+        self.test_guard = test_guard or TestFileGuard("off")
 
     async def execute(self, path: str, content: str) -> ToolResult:
         """Execute the tool."""
         try:
-            file_path = self.repo_path / path
+            blocked = self.test_guard.check(path)
+            if blocked:
+                return ToolResult(success=False, output="", error=blocked)
+            file_path = resolve_repo_path(self.repo_path, path)
             file_path.parent.mkdir(parents=True, exist_ok=True)
             file_path.write_text(content, encoding="utf-8")
-            return ToolResult(success=True, output=f"Successfully wrote to {path}")
+            msg = f"Successfully wrote to {path}"
+            warn = self.test_guard.warning_for(path)
+            if warn:
+                msg = f"{warn}\n{msg}"
+            return ToolResult(success=True, output=msg)
         except Exception as e:
             return ToolResult(success=False, output="", error=str(e))
 
@@ -80,76 +101,55 @@ class ApplyPatchTool:
     """Apply a unified diff patch or search/replace edit."""
 
     name = "apply_patch"
-    description = "Apply a patch using unified diff format or search/replace"
+    description = (
+        "Apply a unified diff (@@ hunks that must match the current file) or a "
+        "SEARCH:/REPLACE: edit. Fails with a clear error if the hunk or search "
+        "string does not match; never writes a patch fragment as the file."
+    )
     parameters = {
         "type": "object",
         "properties": {
             "path": {"type": "string", "description": "Path to the file relative to repo root"},
             "patch": {
                 "type": "string",
-                "description": "Unified diff patch or search/replace in format SEARCH:\n...\nREPLACE:\n...",
+                "description": (
+                    "Unified diff with @@ hunks, or SEARCH:\\n...\\nREPLACE:\\n... "
+                    "(multiple SEARCH/REPLACE blocks are applied in order)"
+                ),
             },
         },
         "required": ["path", "patch"],
     }
 
-    def __init__(self, repo_path: Path):
+    def __init__(self, repo_path: Path, test_guard: TestFileGuard | None = None):
         self.repo_path = repo_path
+        self.test_guard = test_guard or TestFileGuard("off")
 
     async def execute(self, path: str, patch: str) -> ToolResult:
         """Execute the tool."""
         try:
-            file_path = self.repo_path / path
+            blocked = self.test_guard.check(path)
+            if blocked:
+                return ToolResult(success=False, output="", error=blocked)
+
+            file_path = resolve_repo_path(self.repo_path, path)
             if not file_path.exists():
                 return ToolResult(success=False, output="", error=f"File not found: {path}")
 
             original = file_path.read_text(encoding="utf-8")
+            try:
+                modified = apply_patch_text(original, patch)
+            except PatchError as e:
+                return ToolResult(success=False, output="", error=str(e))
 
-            if "SEARCH:" in patch and "REPLACE:" in patch:
-                result = self._apply_search_replace(original, patch)
-            else:
-                result = self._apply_unified_diff(original, patch)
-
-            if result.success:
-                file_path.write_text(result.output, encoding="utf-8")
-
-            return result
+            file_path.write_text(modified, encoding="utf-8")
+            msg = f"Successfully applied patch to {path}"
+            warn = self.test_guard.warning_for(path)
+            if warn:
+                msg = f"{warn}\n{msg}"
+            return ToolResult(success=True, output=msg)
         except Exception as e:
             return ToolResult(success=False, output="", error=str(e))
-
-    def _apply_search_replace(self, original: str, patch: str) -> ToolResult:
-        """Apply search/replace patch."""
-        parts = patch.split("REPLACE:", 1)
-        if len(parts) != 2:
-            return ToolResult(success=False, output="", error="Invalid search/replace format")
-
-        search = parts[0].replace("SEARCH:", "", 1)
-        replace = parts[1]
-        if search.startswith("\n"):
-            search = search[1:]
-        if replace.startswith("\n"):
-            replace = replace[1:]
-        search = search.rstrip("\n")
-        replace = replace.rstrip("\n")
-
-        if search not in original:
-            return ToolResult(success=False, output="", error="Search string not found")
-
-        modified = original.replace(search, replace, 1)
-        return ToolResult(success=True, output=modified)
-
-    def _apply_unified_diff(self, original: str, patch: str) -> ToolResult:
-        """Apply unified diff patch."""
-        try:
-            original.splitlines(keepends=True)
-            patch_lines = patch.splitlines(keepends=True)
-
-            result_lines = list(difflib.restore(patch_lines, 2))
-            modified = "".join(result_lines)
-
-            return ToolResult(success=True, output=modified)
-        except Exception as e:
-            return ToolResult(success=False, output="", error=f"Failed to apply patch: {e}")
 
 
 class RunShellTool:
@@ -407,12 +407,17 @@ class ListFilesTool:
             return ToolResult(success=False, output="", error=str(e))
 
 
-def get_all_tools(repo_path: Path, use_docker: bool = False) -> list[Any]:
+def get_all_tools(
+    repo_path: Path,
+    use_docker: bool = False,
+    test_guard: TestFileGuard | None = None,
+) -> list[Any]:
     """Get all available tools."""
+    guard = test_guard or TestFileGuard("off")
     return [
         ReadFileTool(repo_path),
-        WriteFileTool(repo_path),
-        ApplyPatchTool(repo_path),
+        WriteFileTool(repo_path, test_guard=guard),
+        ApplyPatchTool(repo_path, test_guard=guard),
         RunShellTool(repo_path, use_docker=use_docker),
         SearchCodeTool(repo_path),
         ListFilesTool(repo_path),

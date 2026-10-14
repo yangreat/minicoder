@@ -7,6 +7,7 @@ export const TaskInput: React.FC = () => {
   const [task, setTask] = useState('');
   const [repoPath, setRepoPath] = useState('.');
   const [useMock, setUseMock] = useState(true);
+  const [useMulti, setUseMulti] = useState(false);
   const [isSubmitting, setIsSubmitting] = useState(false);
   const { setError, setCurrentRun, setCurrentEvents } = useStore();
 
@@ -23,6 +24,7 @@ export const TaskInput: React.FC = () => {
         repo_path: repoPath,
         use_mock: useMock,
         max_steps: 30,
+        mode: useMulti ? 'multi' : 'single',
       };
 
       const response = await apiClient.startRun(request);
@@ -74,6 +76,19 @@ export const TaskInput: React.FC = () => {
               disabled={isSubmitting}
             />
             <span>Demo Mode (Mock LLM)</span>
+          </label>
+        </div>
+
+        <div className="form-group checkbox">
+          <label>
+            <input
+              type="checkbox"
+              checked={useMulti}
+              onChange={(e) => setUseMulti(e.target.checked)}
+              disabled={isSubmitting}
+              data-testid="multi-agent-checkbox"
+            />
+            <span>Multi-agent (planner + concurrent sub-agents)</span>
           </label>
         </div>
 

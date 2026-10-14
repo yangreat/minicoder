@@ -4,11 +4,11 @@ This toy repository contains a calculator with a bug.
 
 ## The Bug
 
-The calculator doesn't handle division by zero properly - it raises a raw ZeroDivisionError instead of checking first.
+Division by zero currently raises a raw `ZeroDivisionError` from `a / b`. Tests (and this README) require a checked `ValueError` instead.
 
 ## Expected Fix
 
-The calculator should check if the divisor is zero before performing division and raise a ValueError with a clear message.
+The calculator should check if the divisor is zero before performing division and raise a `ValueError` with a message containing `"zero"` (for example `"Cannot divide by zero"`).
 
 ## Tests
 
