@@ -8,7 +8,7 @@ export const TaskInput: React.FC = () => {
   const [repoPath, setRepoPath] = useState('.');
   const [useMock, setUseMock] = useState(true);
   const [isSubmitting, setIsSubmitting] = useState(false);
-  const { setError, setCurrentRun } = useStore();
+  const { setError, setCurrentRun, setCurrentEvents } = useStore();
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -26,8 +26,10 @@ export const TaskInput: React.FC = () => {
       };
 
       const response = await apiClient.startRun(request);
-      const run = await apiClient.getRun(response.run_id, repoPath);
-      setCurrentRun(run);
+      const effectiveRepo = (response as { repo_path?: string }).repo_path || repoPath;
+      const run = await apiClient.getRun(response.run_id, effectiveRepo);
+      setCurrentEvents([]);
+      setCurrentRun({ ...run, repo_path: effectiveRepo });
     } catch (error) {
       setError(error instanceof Error ? error.message : 'Failed to start run');
     } finally {

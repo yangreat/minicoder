@@ -4,7 +4,7 @@ import { apiClient } from '../api/client';
 import { useStore } from '../store';
 
 export const DiffViewer: React.FC = () => {
-  const { currentRun, setError } = useStore();
+  const { currentRun, currentEvents, setError } = useStore();
   const [diff, setDiff] = useState('');
   const [original, setOriginal] = useState('');
   const [modified, setModified] = useState('');
@@ -28,8 +28,8 @@ export const DiffViewer: React.FC = () => {
       try {
         const cps = await apiClient.listCheckpoints(currentRun.run_id, currentRun.repo_path);
         setCheckpoints(cps);
-        if (cps.length > 0) {
-          setSelectedCheckpoint(cps[0].full_sha);
+        if (cps.length > 0 && !selectedCheckpoint) {
+          setSelectedCheckpoint(cps[cps.length - 1].full_sha);
         }
       } catch (error) {
         console.error('Failed to load checkpoints:', error);
@@ -38,7 +38,7 @@ export const DiffViewer: React.FC = () => {
 
     loadDiff();
     loadCheckpoints();
-  }, [currentRun?.run_id]);
+  }, [currentRun?.run_id, currentRun?.state, currentEvents.length]);
 
   const parseDiff = (diffText: string) => {
     const lines = diffText.split('\n');
@@ -65,16 +65,18 @@ export const DiffViewer: React.FC = () => {
   };
 
   const handleReject = async () => {
-    if (!currentRun || !selectedCheckpoint) return;
+    if (!currentRun) return;
+    const baseline = checkpoints.length > 0
+      ? checkpoints[checkpoints.length - 1].full_sha
+      : selectedCheckpoint;
+    if (!baseline) return;
 
-    if (!confirm('Are you sure you want to rollback to this checkpoint? This will revert all changes.')) {
+    if (!confirm('Reject these changes and rollback to the run baseline? This restores the files from before the agent edited them.')) {
       return;
     }
 
     try {
-      await apiClient.rollback(currentRun.run_id, { checkpoint_sha: selectedCheckpoint }, currentRun.repo_path);
-      alert('Successfully rolled back to checkpoint ' + selectedCheckpoint.substring(0, 8));
-      
+      await apiClient.rollback(currentRun.run_id, { checkpoint_sha: baseline }, currentRun.repo_path);
       const result = await apiClient.getDiff(currentRun.run_id, currentRun.repo_path);
       setDiff(result.diff);
       parseDiff(result.diff);
@@ -92,7 +94,7 @@ export const DiffViewer: React.FC = () => {
   }
 
   return (
-    <div className="diff-viewer">
+    <div className="diff-viewer" data-testid="diff-viewer">
       <div className="diff-header">
         <h3>Code Changes</h3>
         <div className="diff-actions">
@@ -109,10 +111,10 @@ export const DiffViewer: React.FC = () => {
               ))}
             </select>
           )}
-          <button onClick={handleApprove} className="approve-btn">
+          <button onClick={handleApprove} className="approve-btn" data-testid="approve-btn">
             ✓ Approve
           </button>
-          <button onClick={handleReject} className="reject-btn">
+          <button onClick={handleReject} className="reject-btn" data-testid="reject-btn">
             ✗ Reject & Rollback
           </button>
         </div>

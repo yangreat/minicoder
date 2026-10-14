@@ -17,13 +17,12 @@ class TokenCounter:
 
     def __init__(self, model: str = "gpt-4"):
         self.model = model
+        self.encoding: Any = None
         if HAS_TIKTOKEN:
             try:
                 self.encoding = tiktoken.encoding_for_model(model)
             except KeyError:
                 self.encoding = tiktoken.get_encoding("cl100k_base")
-        else:
-            self.encoding = None
 
     def count(self, text: str) -> int:
         """Count tokens in text."""

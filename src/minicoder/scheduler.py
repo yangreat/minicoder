@@ -188,7 +188,7 @@ class Planner:
     @staticmethod
     def create_task_graph(steps: list[dict[str, Any]], scheduler: TaskScheduler) -> list[str]:
         """Create a task graph from decomposed steps."""
-        task_ids = []
+        task_ids: list[str] = []
 
         for step in steps:
             depends_on = step.get("depends_on", [])

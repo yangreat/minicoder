@@ -38,6 +38,8 @@ htmlcov/
 # MiniCoder
 .minicoder/
 *.db
+benchmarks/toy_repos/**/.git/
+benchmarks/toy_repos/**/.minicoder/
 
 # Frontend
 web/node_modules/

@@ -74,6 +74,8 @@ graph TB
 
 ![MiniCoder Console](docs/images/console-screenshot.png)
 
+![Monaco diff of the calculator fix](docs/images/diff-viewer.png)
+
 MiniCoder 提供了一个现代化的 Web 控制台，使用 **React + TypeScript** 构建：
 
 **前端特性**：
@@ -414,6 +416,8 @@ See the Mermaid diagram in the Chinese section above for the complete system arc
 ### 🖥️ Web Console
 
 ![MiniCoder Console](docs/images/console-screenshot.png)
+
+![Monaco diff of the calculator fix](docs/images/diff-viewer.png)
 
 MiniCoder features a modern **React + TypeScript** web console with:
 

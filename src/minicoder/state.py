@@ -30,6 +30,8 @@ class EventType(str, Enum):
     TOOL_CALLED = "tool_called"
     TOOL_RESULT = "tool_result"
     CHECKPOINT_CREATED = "checkpoint_created"
+    TASK_CREATED = "task_created"
+    TASK_STATUS_CHANGED = "task_status_changed"
     ERROR = "error"
 
 

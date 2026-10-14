@@ -28,7 +28,7 @@ jobs:
 
     - name: Run type checking
       run: |
-        mypy src/minicoder --ignore-missing-imports || echo "Type checking has known issues, continuing..."
+        mypy src/minicoder --ignore-missing-imports
 
     - name: Run linting
       run: |

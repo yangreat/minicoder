@@ -27,9 +27,12 @@ export const useStore = create<AppState>((set) => ({
   setRuns: (runs) => set({ runs }),
   setCurrentRun: (run) => set({ currentRun: run }),
   setCurrentEvents: (events) => set({ currentEvents: events }),
-  addEvent: (event) => set((state) => ({
-    currentEvents: [...state.currentEvents, event],
-  })),
+  addEvent: (event) => set((state) => {
+    if (state.currentEvents.some((existing) => existing.id === event.id)) {
+      return state;
+    }
+    return { currentEvents: [...state.currentEvents, event] };
+  }),
   setLoading: (loading) => set({ isLoading: loading }),
   setError: (error) => set({ error }),
   updateRun: (run) => set((state) => ({

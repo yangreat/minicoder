@@ -7,48 +7,67 @@ import { useStore } from '../store';
 import type { AgentEvent } from '../types';
 
 export const EventTimeline: React.FC = () => {
-  const { currentRun, currentEvents, addEvent, setCurrentEvents, setError } = useStore();
+  const { currentRun, currentEvents, addEvent, setCurrentEvents, setError, updateRun } = useStore();
   const eventSourceRef = useRef<EventSource | null>(null);
 
   useEffect(() => {
     if (!currentRun) return;
 
+    let cancelled = false;
+
+    const refreshRun = async () => {
+      try {
+        const run = await apiClient.getRun(currentRun.run_id, currentRun.repo_path);
+        if (!cancelled) updateRun(run);
+        return run;
+      } catch {
+        return null;
+      }
+    };
+
     const loadEvents = async () => {
       try {
         const events = await apiClient.getRunEvents(currentRun.run_id, currentRun.repo_path);
-        setCurrentEvents(events);
+        if (!cancelled) setCurrentEvents(events);
       } catch (error) {
-        setError(error instanceof Error ? error.message : 'Failed to load events');
+        if (!cancelled) setError(error instanceof Error ? error.message : 'Failed to load events');
       }
     };
 
     loadEvents();
 
-    if (currentRun.state !== 'done' && currentRun.state !== 'failed') {
-      const eventSource = apiClient.createEventSource(currentRun.run_id, currentRun.repo_path);
+    const eventSource = apiClient.createEventSource(currentRun.run_id, currentRun.repo_path);
 
-      eventSource.addEventListener('agent_event', (e) => {
-        const event = JSON.parse(e.data) as AgentEvent;
-        addEvent(event);
-      });
+    eventSource.addEventListener('agent_event', (e) => {
+      const event = JSON.parse(e.data) as AgentEvent;
+      addEvent(event);
+    });
 
-      eventSource.addEventListener('run_complete', () => {
-        eventSource.close();
-      });
+    eventSource.addEventListener('run_complete', () => {
+      void loadEvents();
+      void refreshRun();
+      eventSource.close();
+    });
 
-      eventSource.onerror = () => {
-        eventSource.close();
-      };
+    eventSource.onerror = () => {
+      void loadEvents();
+    };
 
-      eventSourceRef.current = eventSource;
-    }
+    eventSourceRef.current = eventSource;
+
+    const poll = window.setInterval(() => {
+      void loadEvents();
+      void refreshRun();
+    }, 800);
 
     return () => {
+      cancelled = true;
+      window.clearInterval(poll);
       if (eventSourceRef.current) {
         eventSourceRef.current.close();
       }
     };
-  }, [currentRun?.run_id]);
+  }, [currentRun?.run_id, currentRun?.repo_path]);
 
   if (!currentRun) {
     return <div className="event-timeline empty">No run selected</div>;
@@ -142,6 +161,23 @@ const EventItem: React.FC<{ event: AgentEvent }> = ({ event }) => {
           </div>
         );
 
+      case 'task_created': {
+        const subtask = event.data.subtask as { description?: string; status?: string } | undefined;
+        return (
+          <div className="event-content">
+            <strong>Subtask created</strong>
+            <p>{subtask?.description} ({subtask?.status})</p>
+          </div>
+        );
+      }
+
+      case 'task_status_changed':
+        return (
+          <div className="event-content">
+            <strong>Subtask {String(event.data.new_status)}</strong>
+          </div>
+        );
+
       default:
         return (
           <div className="event-content">
@@ -153,7 +189,7 @@ const EventItem: React.FC<{ event: AgentEvent }> = ({ event }) => {
   };
 
   return (
-    <div className={`event event-${event.event_type}`}>
+    <div className={`event event-item event-${event.event_type}`} data-testid="event-item">
       <div className="event-time">
         {new Date(event.timestamp * 1000).toLocaleTimeString()}
       </div>

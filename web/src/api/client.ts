@@ -32,7 +32,7 @@ class ApiClient {
     return response.json();
   }
 
-  async startRun(request: StartRunRequest): Promise<{ run_id: string; status: string }> {
+  async startRun(request: StartRunRequest): Promise<{ run_id: string; status: string; repo_path?: string }> {
     const response = await fetch(`${API_BASE}/runs/start`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },

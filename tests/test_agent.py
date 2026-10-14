@@ -50,7 +50,8 @@ async def test_agent_simple_task(tmp_path: Path) -> None:
         if result["status"] != "success":
             print(f"Error message: {result.get('message', 'No message')}")
 
-        assert result["status"] == "success", f"Expected success but got {result['status']}: {result.get('message', '')}"
+        status = result["status"]
+        assert status == "success", f"Expected success but got {status}: {result.get('message', '')}"
         assert (tmp_path / "hello.txt").exists()
         assert (tmp_path / "hello.txt").read_text() == "Hello, World!"
 

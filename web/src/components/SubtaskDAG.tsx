@@ -74,7 +74,7 @@ export const SubtaskDAG: React.FC = () => {
       flowNodes.push({
         id: task.id,
         type: 'default',
-        position: { x: 250, y: index * 120 + 50 },
+        position: { x: 40 + (index % 3) * 280, y: 40 + Math.floor(index / 3) * 140 },
         data: {
           label: (
             <div style={{ padding: '10px', minWidth: '200px' }}>
@@ -131,7 +131,7 @@ export const SubtaskDAG: React.FC = () => {
   }
 
   return (
-    <div className="subtask-dag">
+    <div className="subtask-dag" data-testid="subtask-dag">
       <div className="dag-header">
         <h3>Task Dependency Graph</h3>
         <div className="legend">
@@ -155,6 +155,7 @@ export const SubtaskDAG: React.FC = () => {
       </div>
       <div style={{ height: '500px', background: '#0f172a' }}>
         <ReactFlow
+          key={nodes.length}
           nodes={nodes}
           edges={edges}
           onNodesChange={onNodesChange}

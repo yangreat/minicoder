@@ -123,8 +123,14 @@ class ApplyPatchTool:
         if len(parts) != 2:
             return ToolResult(success=False, output="", error="Invalid search/replace format")
 
-        search = parts[0].replace("SEARCH:", "").strip()
-        replace = parts[1].strip()
+        search = parts[0].replace("SEARCH:", "", 1)
+        replace = parts[1]
+        if search.startswith("\n"):
+            search = search[1:]
+        if replace.startswith("\n"):
+            replace = replace[1:]
+        search = search.rstrip("\n")
+        replace = replace.rstrip("\n")
 
         if search not in original:
             return ToolResult(success=False, output="", error="Search string not found")

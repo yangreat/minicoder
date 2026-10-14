@@ -1,5 +1,6 @@
 """FastAPI server for MiniCoder web console."""
 
+import asyncio
 import json
 from collections.abc import AsyncIterator
 from pathlib import Path
@@ -182,63 +183,31 @@ async def get_run_events(run_id: str, repo_path: str = ".", limit: int | None = 
     ]
 
 
-async def run_agent_with_stream(
-    agent: CodingAgent,
-    task: str,
-    run_id: str | None = None,
-    resume: bool = False,
-) -> AsyncIterator[dict[str, Any]]:
-    """Run agent and stream events."""
-    try:
-        if resume:
-            result = await agent.resume(run_id)
-        else:
-            result = await agent.run(task, run_id)
-
-        yield {
-            "event": "run_complete",
-            "data": result,
-        }
-    except Exception as e:
-        yield {
-            "event": "run_error",
-            "data": {"error": str(e)},
-        }
-
-
 @app.post("/api/runs/start")
 async def start_run(request: StartRunRequest, background_tasks: BackgroundTasks) -> dict[str, str]:
     """Start a new run."""
     run_id = str(uuid4())
     repo_path = Path(request.repo_path).resolve()
 
+    if request.use_mock:
+        from minicoder.demo import build_demo_client, resolve_mock_repo
+
+        repo_path = resolve_mock_repo(repo_path)
+
     manager = get_state_manager(str(repo_path))
     await ensure_state_manager_initialized(manager)
+    await manager.create_run(run_id, request.task, str(repo_path), AgentState.PLANNING)
 
     if request.use_mock:
-        from tests.mock_llm import MockOpenAI, MockResponse, MockToolCall
-
-        responses = [
-            MockResponse(
-                tool_calls=[
-                    MockToolCall(
-                        id="call_demo",
-                        function_name="finish",
-                        arguments=json.dumps({"message": "Demo mode - task acknowledged"}),
-                    )
-                ]
-            )
-        ]
-        mock_client = MockOpenAI(responses)
-
         agent = CodingAgent(
             repo_path,
             manager,
             model=request.model,
             max_steps=request.max_steps,
             use_docker=request.use_docker,
+            step_delay=0.35,
         )
-        agent.client = mock_client
+        agent.client = build_demo_client(repo_path)
     else:
         agent = CodingAgent(
             repo_path,
@@ -261,7 +230,7 @@ async def start_run(request: StartRunRequest, background_tasks: BackgroundTasks)
 
     background_tasks.add_task(run_in_background)
 
-    return {"run_id": run_id, "status": "started"}
+    return {"run_id": run_id, "status": "started", "repo_path": str(repo_path)}
 
 
 @app.get("/api/runs/{run_id}/stream")
@@ -271,26 +240,47 @@ async def stream_run(run_id: str, repo_path: str = ".") -> EventSourceResponse:
     await ensure_state_manager_initialized(manager)
 
     async def event_generator() -> AsyncIterator[dict[str, Any]]:
-        """Generate SSE events."""
-        events = await manager.get_events(run_id)
-        for event in events:
-            yield {
-                "event": "agent_event",
-                "data": json.dumps({
-                    "id": event.id,
-                    "run_id": event.run_id,
-                    "timestamp": event.timestamp,
-                    "event_type": event.event_type.value,
-                    "data": event.data,
-                }),
-            }
+        """Poll the event log until the run reaches a terminal state."""
+        sent = 0
+        while True:
+            events = await manager.get_events(run_id)
+            for event in events[sent:]:
+                yield {
+                    "event": "agent_event",
+                    "data": json.dumps(
+                        {
+                            "id": event.id,
+                            "run_id": event.run_id,
+                            "timestamp": event.timestamp,
+                            "event_type": event.event_type.value,
+                            "data": event.data,
+                        }
+                    ),
+                }
+            sent = len(events)
 
-        run = await manager.get_run(run_id)
-        if run and run.state in [AgentState.DONE, AgentState.FAILED]:
-            yield {
-                "event": "run_complete",
-                "data": json.dumps({"status": run.state.value}),
-            }
+            run = await manager.get_run(run_id)
+            if run and run.state in (AgentState.DONE, AgentState.FAILED):
+                remaining = await manager.get_events(run_id)
+                for event in remaining[sent:]:
+                    yield {
+                        "event": "agent_event",
+                        "data": json.dumps(
+                            {
+                                "id": event.id,
+                                "run_id": event.run_id,
+                                "timestamp": event.timestamp,
+                                "event_type": event.event_type.value,
+                                "data": event.data,
+                            }
+                        ),
+                    }
+                yield {
+                    "event": "run_complete",
+                    "data": json.dumps({"status": run.state.value}),
+                }
+                break
+            await asyncio.sleep(0.2)
 
     return EventSourceResponse(event_generator())
 
@@ -308,28 +298,16 @@ async def resume_run(run_id: str, request: ResumeRunRequest, background_tasks: B
     repo_path = Path(run.repo_path)
 
     if request.use_mock:
-        from tests.mock_llm import MockOpenAI, MockResponse, MockToolCall
-
-        responses = [
-            MockResponse(
-                tool_calls=[
-                    MockToolCall(
-                        id="call_demo",
-                        function_name="finish",
-                        arguments=json.dumps({"message": "Demo mode - resumed"}),
-                    )
-                ]
-            )
-        ]
-        mock_client = MockOpenAI(responses)
+        from minicoder.demo import build_demo_client
 
         agent = CodingAgent(
             repo_path,
             manager,
             model=request.model,
             max_steps=request.max_steps,
+            step_delay=0.35,
         )
-        agent.client = mock_client
+        agent.client = build_demo_client(repo_path)
     else:
         agent = CodingAgent(
             repo_path,
@@ -389,7 +367,10 @@ async def get_run_diff(run_id: str, repo_path: str = ".", from_sha: str | None =
     checkpoint_manager = CheckpointManager(Path(repo_path))
 
     try:
-        diff = checkpoint_manager.get_diff(from_sha=from_sha)
+        if from_sha:
+            diff = checkpoint_manager.get_diff(from_sha=from_sha)
+        else:
+            diff = checkpoint_manager.get_run_diff(run_id)
         return DiffResponse(diff=diff)
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
