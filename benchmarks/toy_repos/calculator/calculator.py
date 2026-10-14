@@ -1,4 +1,4 @@
-"""Bug: Calculator returns wrong result for division by zero."""
+"""Bug: division by zero raises ZeroDivisionError instead of ValueError."""
 
 
 def calculator(a: float, b: float, operation: str) -> float:

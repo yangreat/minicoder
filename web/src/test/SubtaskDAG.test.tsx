@@ -25,7 +25,7 @@ describe('SubtaskDAG', () => {
     });
 
     render(<SubtaskDAG />);
-    expect(screen.getByText(/No subtasks available/i)).toBeInTheDocument();
+    expect(screen.getByText(/No subtasks yet/i)).toBeInTheDocument();
   });
 
   it('renders DAG header when subtasks exist', () => {

@@ -238,6 +238,12 @@ minicoder run "添加输入验证" --repo /path/to/repo
 # 使用 Docker 沙箱
 minicoder run "运行危险脚本" --docker
 
+# 多代理（planner 分解 + 并发子代理）
+minicoder run "修复这个 bug" --mode multi --max-parallel 3
+
+# 禁止改测试文件
+minicoder run "修复这个 bug" --protect-tests block
+
 # 恢复中断的运行
 minicoder resume <run_id>
 
@@ -256,14 +262,38 @@ minicoder serve --port 8000
 
 ### 🧪 评估
 
-#### 运行内置基准测试
+内置 `benchmarks/toy_repos/` 目前有约 10 个故意失败的玩具仓库（含多文件任务）。评测会把每个任务复制到临时目录、运行代理、**用原始测试文件打分**（代理改测试不算通过），并写出 JSON + Markdown。
+
+针对 OpenAI 兼容接口的评测命令：
 
 ```bash
-cd benchmarks
-python evaluate.py
+export OPENAI_API_KEY="sk-..."
+export OPENAI_BASE_URL="https://api.example.com/v1"   # 任意 OpenAI 兼容 endpoint
+export OPENAI_MODEL="your-model-id"
+
+python benchmarks/evaluate.py \
+  --model "$OPENAI_MODEL" \
+  --base-url "$OPENAI_BASE_URL" \
+  --compression default \
+  --agent-mode single \
+  --repeats 1 \
+  --max-steps 15
 ```
 
-这会在 `toy_repos` 中的小型测试仓库上运行代理并报告结果。
+常用开关：
+
+- `--compression {default,off,aggressive}`：上下文压缩强度
+- `--agent-mode {single,multi}`：单代理循环或多代理（planner 分解 + 并发子代理）
+- `--repeats N`：每任务重复次数（报告 mean ± stdev）
+- `--protect-tests {block,flag,off}`：评测默认 `block`，禁止改测试文件
+- `--request-timeout` / `--max-retries`：LLM 请求超时与退避重试（也可用 `MINICODER_REQUEST_TIMEOUT`、`MINICODER_MAX_RETRIES`）
+- `--mock`：用 mock LLM 冒烟测试评测脚手架（不会真正修 bug）
+
+结果写到 `benchmarks/results/results.json` 和 `benchmarks/results/results.md`。
+
+```bash
+python benchmarks/evaluate.py --list-tasks
+```
 
 #### 在 SWE-bench Lite 上运行
 
@@ -281,19 +311,18 @@ python -m benchmarks.swe_bench_adapter
 
 #### 消融实验
 
+评测 CLI 已覆盖压缩档位和 single/multi。代码里也可以直接构造：
+
 ```python
-# 在代码中切换功能标志
 agent = CodingAgent(
     repo_path,
     state_manager,
-    max_steps=30,  # 限制步数
-    use_docker=False,  # 禁用 Docker
-)
-
-context = ContextManager(
-    repo_path,
-    max_tokens=8000,  # 调整 token 预算
-    keep_recent=5,  # 调整压缩策略
+    model=os.environ["OPENAI_MODEL"],
+    max_steps=30,
+    mode="multi",          # 或 "single"
+    request_timeout=120,
+    max_retries=2,
+    protect_tests="block",
 )
 ```
 
@@ -360,18 +389,10 @@ ruff check src/minicoder tests --fix
 
 ### 📊 评估结果
 
-> **注意**：这是一个模板。实际数字需要使用真实 LLM 运行基准测试获得。
+2026-10-14 在 DashScope 上对 PR #2 分支（`cc3079d`）做了实测，**完整表格、命令和注释见 [docs/eval-results.md](docs/eval-results.md)**（原文照录，未改数字）。
 
-| 基准测试 | 通过 | 步数 | Token 用量 |
-|---------|------|------|-----------|
-| calculator | ✓ | 8 | 1,234 |
-| **总计** | **1/1** | **8** | **1,234** |
-
-要生成实际结果：
-
-1. 配置 LLM API（见上文）
-2. 运行 `python benchmarks/evaluate.py`
-3. 查看 `benchmarks/results/results.json`
+- **v2（`cc3079d` + 本地 scheduler 补丁）single**：qwen3.6-plus 三档压缩各 30/30，qwen-plus default 20/20，测试通过率 100%。**multi**：qwen3.6-plus 22/30，qwen-plus 3/20，且 **0/50 次调用 finish**。
+- **v3（`425af4a`）**：死锁已消失；single 仍 10/10。**multi 回退**：qwen3.6-plus 2/30，qwen-plus 0/20，finish 1/50。原因是并行 read 子任务 3 步耗尽后失败，卡住 locate+apply。不要把 v2/v3 的 multi 数字当成后续提交的结果。
 
 ### 🗺️ 路线图
 
@@ -386,8 +407,8 @@ ruff check src/minicoder tests --fix
 - [x] SSE 实时事件流
 - [x] Monaco 代码查看器（带批准/回滚）
 - [x] 子任务 DAG 可视化（React Flow）
+- [x] 多代理协作（planner 分解 + 并发子代理，SSE/DAG 事件）
 - [ ] 基于 tree-sitter 的代码索引
-- [ ] 多代理协作
 - [ ] SWE-bench Lite 完整评估
 
 ### 📄 许可证
@@ -581,6 +602,12 @@ minicoder run "Add input validation" --repo /path/to/repo
 # Use Docker sandbox
 minicoder run "Run dangerous script" --docker
 
+# Multi-agent (planner + concurrent sub-agents)
+minicoder run "Fix this bug" --mode multi --max-parallel 3
+
+# Block edits to test files
+minicoder run "Fix this bug" --protect-tests block
+
 # Resume interrupted run
 minicoder resume <run_id>
 
@@ -599,14 +626,34 @@ minicoder serve --port 8000
 
 ### 🧪 Evaluation
 
-#### Run Built-in Benchmarks
+`benchmarks/toy_repos/` currently has about 10 intentionally failing toy repos (some multi-file). The harness copies each task to a fresh temp dir, runs the agent, **grades against the original tests** (rewriting tests does not count), and writes JSON + Markdown.
+
+Against any OpenAI-compatible endpoint:
 
 ```bash
-cd benchmarks
-python evaluate.py
+export OPENAI_API_KEY="sk-..."
+export OPENAI_BASE_URL="https://api.example.com/v1"   # any OpenAI-compatible endpoint
+export OPENAI_MODEL="your-model-id"
+
+python benchmarks/evaluate.py \
+  --model "$OPENAI_MODEL" \
+  --base-url "$OPENAI_BASE_URL" \
+  --compression default \
+  --agent-mode single \
+  --repeats 1 \
+  --max-steps 15
 ```
 
-This runs the agent on small test repositories in `toy_repos` and reports results.
+Flags:
+
+- `--compression {default,off,aggressive}`
+- `--agent-mode {single,multi}` — single loop vs planner + concurrent sub-agents
+- `--repeats N` — mean ± stdev across repeats
+- `--protect-tests {block,flag,off}` — default `block` in eval
+- `--request-timeout` / `--max-retries` (or `MINICODER_REQUEST_TIMEOUT` / `MINICODER_MAX_RETRIES`)
+- `--mock` — smoke-test the harness with a mock LLM
+
+Output: `benchmarks/results/results.json` and `benchmarks/results/results.md`.
 
 #### Run on SWE-bench Lite
 
@@ -624,19 +671,18 @@ python -m benchmarks.swe_bench_adapter
 
 #### Ablation Studies
 
+The eval CLI covers compression presets and single/multi. You can also construct an agent directly:
+
 ```python
-# Toggle features in code
 agent = CodingAgent(
     repo_path,
     state_manager,
-    max_steps=30,  # Limit steps
-    use_docker=False,  # Disable Docker
-)
-
-context = ContextManager(
-    repo_path,
-    max_tokens=8000,  # Adjust token budget
-    keep_recent=5,  # Adjust compression
+    model=os.environ["OPENAI_MODEL"],
+    max_steps=30,
+    mode="multi",          # or "single"
+    request_timeout=120,
+    max_retries=2,
+    protect_tests="block",
 )
 ```
 
@@ -703,18 +749,10 @@ ruff check src/minicoder tests --fix
 
 ### 📊 Evaluation Results
 
-> **Note**: This is a template. Actual numbers require running benchmarks with a real LLM.
+DashScope numbers from 2026-10-14 on PR #2 (`cc3079d`) are recorded verbatim in [docs/eval-results.md](docs/eval-results.md). No new figures are invented here.
 
-| Benchmark | Pass | Steps | Tokens |
-|-----------|------|-------|--------|
-| calculator | ✓ | 8 | 1,234 |
-| **Total** | **1/1** | **8** | **1,234** |
-
-To generate actual results:
-
-1. Configure LLM API (see above)
-2. Run `python benchmarks/evaluate.py`
-3. Check `benchmarks/results/results.json`
+- **v2 (`cc3079d` + local scheduler patch) single**: qwen3.6-plus 30/30 on each compression preset; qwen-plus default 20/20. **multi**: qwen3.6-plus 22/30, qwen-plus 3/20, finish 0/50.
+- **v3 (`425af4a`)**: deadlock gone; single still 10/10. **multi regressed** to qwen3.6-plus 2/30, qwen-plus 0/20, finish 1/50, because parallel read subtasks exhausted a 3-step budget and blocked locate+apply. Do not treat v2/v3 multi rows as results for later commits.
 
 ### 🗺️ Roadmap
 
@@ -729,8 +767,8 @@ To generate actual results:
 - [x] SSE real-time event streaming
 - [x] Monaco code diff viewer (with approve/rollback)
 - [x] Subtask DAG visualization (React Flow)
+- [x] Multi-agent collaboration (planner + concurrent sub-agents, SSE/DAG events)
 - [ ] Tree-sitter based code indexing
-- [ ] Multi-agent collaboration
 - [ ] Full SWE-bench Lite evaluation
 
 ### 📄 License

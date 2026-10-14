@@ -1,5 +1,8 @@
 """State management with event sourcing and SQLite persistence."""
 
+from __future__ import annotations
+
+import asyncio
 import json
 import time
 from enum import Enum
@@ -64,6 +67,7 @@ class StateManager:
     def __init__(self, db_path: Path):
         self.db_path = db_path
         self._conn: aiosqlite.Connection | None = None
+        self._lock = asyncio.Lock()
 
     async def initialize(self) -> None:
         """Initialize database schema."""
@@ -123,49 +127,32 @@ class StateManager:
             updated_at=now,
         )
 
-        await self._conn.execute(  # type: ignore
-            """
-            INSERT INTO runs (run_id, task, repo_path, state, created_at, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?)
-            """,
-            (run_id, task, repo_path, state.value, now, now),
-        )
-        await self._conn.commit()  # type: ignore
-
-        await self.add_event(
-            run_id, EventType.RUN_STARTED, {"task": task, "repo_path": repo_path}
-        )
+        async with self._lock:
+            await self._conn.execute(  # type: ignore
+                """
+                INSERT INTO runs (run_id, task, repo_path, state, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (run_id, task, repo_path, state.value, now, now),
+            )
+            await self._conn.commit()  # type: ignore
+            await self._add_event_unlocked(
+                run_id, EventType.RUN_STARTED, {"task": task, "repo_path": repo_path}
+            )
 
         return metadata
 
     async def get_run(self, run_id: str) -> RunMetadata | None:
         """Get run metadata."""
-        async with self._conn.execute(  # type: ignore
-            "SELECT * FROM runs WHERE run_id = ?", (run_id,)
-        ) as cursor:
-            row = await cursor.fetchone()
-            if not row:
-                return None
+        async with self._lock:
+            async with self._conn.execute(  # type: ignore
+                "SELECT * FROM runs WHERE run_id = ?", (run_id,)
+            ) as cursor:
+                row = await cursor.fetchone()
+                if not row:
+                    return None
 
-            return RunMetadata(
-                run_id=row[0],
-                task=row[1],
-                repo_path=row[2],
-                state=AgentState(row[3]),
-                created_at=row[4],
-                updated_at=row[5],
-                total_steps=row[6],
-                token_usage=row[7],
-            )
-
-    async def list_runs(self, limit: int = 50) -> list[RunMetadata]:
-        """List all runs."""
-        async with self._conn.execute(  # type: ignore
-            "SELECT * FROM runs ORDER BY created_at DESC LIMIT ?", (limit,)
-        ) as cursor:
-            rows = await cursor.fetchall()
-            return [
-                RunMetadata(
+                return RunMetadata(
                     run_id=row[0],
                     task=row[1],
                     repo_path=row[2],
@@ -175,37 +162,66 @@ class StateManager:
                     total_steps=row[6],
                     token_usage=row[7],
                 )
-                for row in rows
-            ]
+
+    async def list_runs(self, limit: int = 50) -> list[RunMetadata]:
+        """List all runs."""
+        async with self._lock:
+            async with self._conn.execute(  # type: ignore
+                "SELECT * FROM runs ORDER BY created_at DESC LIMIT ?", (limit,)
+            ) as cursor:
+                rows = await cursor.fetchall()
+                return [
+                    RunMetadata(
+                        run_id=row[0],
+                        task=row[1],
+                        repo_path=row[2],
+                        state=AgentState(row[3]),
+                        created_at=row[4],
+                        updated_at=row[5],
+                        total_steps=row[6],
+                        token_usage=row[7],
+                    )
+                    for row in rows
+                ]
 
     async def update_run_state(self, run_id: str, state: AgentState) -> None:
         """Update run state."""
-        await self._conn.execute(  # type: ignore
-            "UPDATE runs SET state = ?, updated_at = ? WHERE run_id = ?",
-            (state.value, time.time(), run_id),
-        )
-        await self._conn.commit()  # type: ignore
-
-        await self.add_event(run_id, EventType.STATE_CHANGED, {"new_state": state.value})
+        async with self._lock:
+            await self._conn.execute(  # type: ignore
+                "UPDATE runs SET state = ?, updated_at = ? WHERE run_id = ?",
+                (state.value, time.time(), run_id),
+            )
+            await self._conn.commit()  # type: ignore
+            await self._add_event_unlocked(
+                run_id, EventType.STATE_CHANGED, {"new_state": state.value}
+            )
 
     async def increment_steps(self, run_id: str) -> None:
         """Increment step counter."""
-        await self._conn.execute(  # type: ignore
-            "UPDATE runs SET total_steps = total_steps + 1, updated_at = ? WHERE run_id = ?",
-            (time.time(), run_id),
-        )
-        await self._conn.commit()  # type: ignore
+        async with self._lock:
+            await self._conn.execute(  # type: ignore
+                "UPDATE runs SET total_steps = total_steps + 1, updated_at = ? WHERE run_id = ?",
+                (time.time(), run_id),
+            )
+            await self._conn.commit()  # type: ignore
 
     async def add_token_usage(self, run_id: str, tokens: int) -> None:
         """Add to token usage."""
-        await self._conn.execute(  # type: ignore
-            "UPDATE runs SET token_usage = token_usage + ?, updated_at = ? WHERE run_id = ?",
-            (tokens, time.time(), run_id),
-        )
-        await self._conn.commit()  # type: ignore
+        async with self._lock:
+            await self._conn.execute(  # type: ignore
+                "UPDATE runs SET token_usage = token_usage + ?, updated_at = ? WHERE run_id = ?",
+                (tokens, time.time(), run_id),
+            )
+            await self._conn.commit()  # type: ignore
 
     async def add_event(self, run_id: str, event_type: EventType, data: dict[str, Any]) -> Event:
         """Add an event to the history."""
+        async with self._lock:
+            return await self._add_event_unlocked(run_id, event_type, data)
+
+    async def _add_event_unlocked(
+        self, run_id: str, event_type: EventType, data: dict[str, Any]
+    ) -> Event:
         event = Event(run_id=run_id, event_type=event_type, data=data)
 
         await self._conn.execute(  # type: ignore
@@ -228,15 +244,16 @@ class StateManager:
             query += " LIMIT ?"
             params = (run_id, limit)
 
-        async with self._conn.execute(query, params) as cursor:  # type: ignore
-            rows = await cursor.fetchall()
-            return [
-                Event(
-                    id=row[0],
-                    run_id=row[1],
-                    timestamp=row[2],
-                    event_type=EventType(row[3]),
-                    data=json.loads(row[4]),
-                )
-                for row in rows
-            ]
+        async with self._lock:
+            async with self._conn.execute(query, params) as cursor:  # type: ignore
+                rows = await cursor.fetchall()
+                return [
+                    Event(
+                        id=row[0],
+                        run_id=row[1],
+                        timestamp=row[2],
+                        event_type=EventType(row[3]),
+                        data=json.loads(row[4]),
+                    )
+                    for row in rows
+                ]

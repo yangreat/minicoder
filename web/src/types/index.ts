@@ -33,6 +33,9 @@ export interface StartRunRequest {
   max_steps?: number;
   use_docker?: boolean;
   use_mock?: boolean;
+  mode?: 'single' | 'multi';
+  max_parallel?: number;
+  protect_tests?: 'off' | 'block' | 'flag';
 }
 
 export interface ResumeRunRequest {

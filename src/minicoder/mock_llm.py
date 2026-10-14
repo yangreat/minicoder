@@ -1,12 +1,15 @@
 """Mock OpenAI client used by tests and demo mode."""
 
+from __future__ import annotations
+
+import asyncio
 from typing import Any
 
 
 class MockChoice:
     """Mock choice from LLM response."""
 
-    def __init__(self, message: "MockMessage"):
+    def __init__(self, message: MockMessage):
         self.message = message
 
 
@@ -16,7 +19,7 @@ class MockMessage:
     def __init__(
         self,
         content: str | None = None,
-        tool_calls: list["MockToolCall"] | None = None,
+        tool_calls: list[MockToolCall] | None = None,
     ):
         self.content = content
         self.tool_calls = tool_calls
@@ -77,15 +80,17 @@ class MockLLM:
         self.responses = responses or []
         self.call_count = 0
         self.calls: list[dict[str, Any]] = []
+        self._lock = asyncio.Lock()
 
     async def create(self, **kwargs: Any) -> MockResponse:
         """Return the next scripted response."""
-        self.calls.append(kwargs)
-        if self.call_count < len(self.responses):
-            response = self.responses[self.call_count]
-            self.call_count += 1
-            return response
-        return MockResponse(content="Mock response")
+        async with self._lock:
+            self.calls.append(kwargs)
+            if self.call_count < len(self.responses):
+                response = self.responses[self.call_count]
+                self.call_count += 1
+                return response
+            return MockResponse(content="Mock response")
 
 
 class MockChat:

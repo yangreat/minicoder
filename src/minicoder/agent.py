@@ -1,4 +1,4 @@
-"""Core coding agent with LLM integration."""
+"""Core coding agent with LLM integration and optional multi-agent mode."""
 
 from __future__ import annotations
 
@@ -13,9 +13,47 @@ from openai import AsyncOpenAI
 
 from minicoder.checkpoint import CheckpointManager
 from minicoder.context import ContextManager
+from minicoder.llm import create_with_retry, default_backoff, default_max_retries, default_timeout
 from minicoder.scheduler import Planner, Task, TaskScheduler, TaskStatus
 from minicoder.state import AgentState, EventType, StateManager
 from minicoder.tools import get_all_tools
+from minicoder.tools.guard import TestFileGuard
+
+MUTATING_TOOLS = {"write_file", "apply_patch", "run_shell"}
+
+
+class StepTotals:
+    """Run-wide LLM-step counter (not a cap)."""
+
+    def __init__(self) -> None:
+        self.value = 0
+        self._lock = asyncio.Lock()
+
+    async def add(self) -> int:
+        async with self._lock:
+            self.value += 1
+            return self.value
+
+
+class StepCounter:
+    """Per-agent step budget, optionally recording into a shared total."""
+
+    def __init__(self, max_steps: int, totals: StepTotals | None = None):
+        self.max_steps = max_steps
+        self.value = 0
+        self._lock = asyncio.Lock()
+        self.totals = totals
+
+    async def consume(self) -> int | None:
+        """Return the new 1-based local step number, or None if the budget is exhausted."""
+        async with self._lock:
+            if self.value >= self.max_steps:
+                return None
+            self.value += 1
+            local = self.value
+        if self.totals is not None:
+            await self.totals.add()
+        return local
 
 
 class CodingAgent:
@@ -27,30 +65,61 @@ class CodingAgent:
         state_manager: StateManager,
         api_key: str | None = None,
         base_url: str | None = None,
-        model: str = "gpt-4",
+        model: str | None = None,
         max_steps: int = 30,
         use_docker: bool = False,
         step_delay: float = 0.0,
+        mode: str = "single",
+        max_parallel: int = 3,
+        request_timeout: float | None = None,
+        max_retries: int | None = None,
+        retry_backoff: float | None = None,
+        protect_tests: str = "off",
+        test_patterns: list[str] | None = None,
     ):
         self.repo_path = Path(repo_path)
         self.state_manager = state_manager
-        self.model = model
+        self.model = model or os.getenv("OPENAI_MODEL") or os.getenv("EVAL_MODEL") or "gpt-4"
         self.max_steps = max_steps
         self.step_delay = step_delay
+        self.mode = mode if mode in ("single", "multi") else "single"
+        self.max_parallel = max_parallel
+        self.request_timeout = (
+            default_timeout() if request_timeout is None else float(request_timeout)
+        )
+        self.max_retries = default_max_retries() if max_retries is None else int(max_retries)
+        self.retry_backoff = default_backoff() if retry_backoff is None else float(retry_backoff)
+        self.protect_tests_mode = protect_tests
+        self.test_patterns = test_patterns
+        self._api_key = api_key
+        self._base_url = base_url
 
         self.client: Any = AsyncOpenAI(
             api_key=api_key or os.getenv("OPENAI_API_KEY", "dummy-key"),
             base_url=base_url or os.getenv("OPENAI_BASE_URL"),
+            timeout=self.request_timeout,
+            max_retries=0,
         )
 
-        self.context = ContextManager(self.repo_path, model=model)
+        self.context = ContextManager(self.repo_path, model=self.model)
         self.checkpoint = CheckpointManager(self.repo_path)
-        self.tools = get_all_tools(self.repo_path, use_docker=use_docker)
+        self.test_guard = TestFileGuard(mode=protect_tests, patterns=test_patterns)
+        self.tools = get_all_tools(
+            self.repo_path, use_docker=use_docker, test_guard=self.test_guard
+        )
+        self._use_docker = use_docker
 
         self.run_id: str | None = None
         self.current_step = 0
         self._plan_tasks: list[Task] = []
         self._plan_cursor = 0
+        self._scheduler: TaskScheduler | None = None
+        self._step_totals = StepTotals()
+        self._step_counter = StepCounter(max_steps, totals=self._step_totals)
+        self._workspace_lock = asyncio.Lock()
+        self._is_subagent = False
+        self.agent_id = "main"
+        self._fell_back_to_single = False
 
     def _require_run_id(self) -> str:
         if not self.run_id:
@@ -61,6 +130,9 @@ class CodingAgent:
         """Run the agent on a task."""
         self.run_id = run_id or str(uuid4())
         self.current_step = 0
+        self._fell_back_to_single = False
+        self._step_totals = StepTotals()
+        self._step_counter = StepCounter(self.max_steps, totals=self._step_totals)
         rid = self._require_run_id()
 
         existing = await self.state_manager.get_run(rid)
@@ -72,7 +144,8 @@ class CodingAgent:
             await self.state_manager.update_run_state(rid, AgentState.PLANNING)
 
         await self._emit_plan(task)
-        self.checkpoint.create_checkpoint(rid, 0, "baseline", allow_empty=True)
+        async with self._workspace_lock:
+            self.checkpoint.create_checkpoint(rid, 0, "baseline", allow_empty=True)
         await self.state_manager.add_event(
             rid,
             EventType.CHECKPOINT_CREATED,
@@ -83,7 +156,26 @@ class CodingAgent:
         self.context.add_message("system", system_prompt)
         self.context.add_message("user", task)
 
-        result = await self._agent_loop()
+        if self.mode == "multi" and not Planner.should_fallback_to_single(
+            self._plan_tasks
+        ):
+            result = await self._run_multi(task)
+        else:
+            if self.mode == "multi":
+                self._fell_back_to_single = True
+                await self.state_manager.add_event(
+                    rid,
+                    EventType.MESSAGE_ADDED,
+                    {
+                        "role": "system",
+                        "content": (
+                            "Plan has fewer than 2 independent edit subtasks "
+                            "(or is a pure chain); falling back to single-agent mode."
+                        ),
+                        "agent_id": "parent",
+                    },
+                )
+            result = await self._agent_loop()
 
         return {
             "run_id": rid,
@@ -100,11 +192,15 @@ class CodingAgent:
 
         self.run_id = run_id
         self.current_step = run.total_steps
+        self._step_counter.value = run.total_steps
 
         events = await self.state_manager.get_events(run_id)
         await self._restore_context_from_events(events)
 
-        result = await self._agent_loop()
+        if self.mode == "multi" and self._scheduler is not None:
+            result = await self._run_multi(run.task)
+        else:
+            result = await self._agent_loop()
 
         return {
             "run_id": self.run_id,
@@ -113,21 +209,40 @@ class CodingAgent:
             "message": result.get("message", ""),
         }
 
+    async def run_subtask(
+        self, overall_task: str, description: str, extra_context: str = ""
+    ) -> dict[str, Any]:
+        """Run this agent as a sub-agent on one subtask (isolated context)."""
+        system_prompt = self.context.get_system_prompt()
+        self.context.add_message("system", system_prompt)
+        user = (
+            "You are a MiniCoder sub-agent working on one subtask of a larger job.\n\n"
+            f"Overall task:\n{overall_task}\n\n"
+            f"Your subtask:\n{description}\n"
+        )
+        if extra_context:
+            user += f"\nContext from completed dependency subtasks:\n{extra_context}\n"
+        user += (
+            "\nFocus only on this subtask. Use tools as needed, then call finish "
+            "when this subtask is done."
+        )
+        self.context.add_message("user", user)
+        return await self._agent_loop()
+
     async def _emit_plan(self, task: str) -> None:
         """Decompose the task and emit DAG events."""
         rid = self._require_run_id()
-        scheduler = TaskScheduler()
+        on_status = self._on_scheduler_status if self.mode == "multi" else None
+        scheduler = TaskScheduler(max_parallel=self.max_parallel, on_status=on_status)
         steps = Planner.decompose_coding_task(task)
-        # Keep the graph small and visual: 3 dependent subtasks.
-        if len(steps) > 3:
-            steps = steps[:3]
-            if "depends_on" in steps[-1]:
-                steps[-1]["depends_on"] = [len(steps) - 2]
-        task_ids = Planner.create_task_graph(steps, scheduler)
+        retries = 1 if self.mode == "multi" else 0
+        task_ids = Planner.create_task_graph(steps, scheduler, max_retries=retries)
+        self._scheduler = scheduler
         self._plan_tasks = []
         for tid in task_ids:
             planned = scheduler.get_task(tid)
             if planned is not None:
+                planned.agent_id = planned.id[:8]
                 self._plan_tasks.append(planned)
         self._plan_cursor = 0
 
@@ -142,11 +257,27 @@ class CodingAgent:
                         "status": planned.status.value,
                         "priority": planned.priority,
                         "dependencies": list(planned.dependencies),
+                        "agent_id": planned.agent_id,
                     }
                 },
             )
             if self.step_delay:
                 await asyncio.sleep(self.step_delay / 2)
+
+    async def _on_scheduler_status(self, task: Task) -> None:
+        rid = self.run_id
+        if not rid:
+            return
+        await self.state_manager.add_event(
+            rid,
+            EventType.TASK_STATUS_CHANGED,
+            {
+                "task_id": task.id,
+                "new_status": task.status.value,
+                "agent_id": task.agent_id or task.id[:8],
+                "description": task.description,
+            },
+        )
 
     async def _set_plan_status(self, index: int, status: TaskStatus) -> None:
         if index < 0 or index >= len(self._plan_tasks):
@@ -159,19 +290,212 @@ class CodingAgent:
         await self.state_manager.add_event(
             rid,
             EventType.TASK_STATUS_CHANGED,
-            {"task_id": task.id, "new_status": status.value},
+            {
+                "task_id": task.id,
+                "new_status": status.value,
+                "agent_id": self.agent_id,
+            },
         )
+
+    def _allocate_subtask_budgets(self, n: int) -> list[int]:
+        """Split the run step cap by subtask kind: edits get most of the steps."""
+        n = max(n, 1)
+        kinds = [t.kind or "edit" for t in self._plan_tasks] or ["edit"] * n
+        weights = {"read": 1, "verify": 2, "edit": 5}
+        wlist = [weights.get(k, 2) for k in kinds]
+        total_w = sum(wlist) or 1
+        budgets = [max(1, (self.max_steps * w) // total_w) for w in wlist]
+
+        def shrink_order() -> list[int]:
+            order: list[int] = []
+            for kind in ("read", "verify", "edit"):
+                order.extend(i for i, k in enumerate(kinds) if k == kind)
+            return order or list(range(n))
+
+        while sum(budgets) > self.max_steps:
+            reduced = False
+            for i in shrink_order():
+                if budgets[i] > 1:
+                    budgets[i] -= 1
+                    reduced = True
+                    break
+            if not reduced:
+                break
+        remainder = max(0, self.max_steps - sum(budgets))
+        edit_idx = [i for i, k in enumerate(kinds) if k == "edit"] or list(range(n))
+        e = 0
+        while remainder > 0:
+            budgets[edit_idx[e % len(edit_idx)]] += 1
+            remainder -= 1
+            e += 1
+        return budgets
+
+    def _spawn_subagent(self, task: Task, budget: int) -> CodingAgent:
+        """Create a sub-agent with isolated context and its own step budget."""
+        sub = CodingAgent(
+            self.repo_path,
+            self.state_manager,
+            api_key=self._api_key,
+            base_url=self._base_url,
+            model=self.model,
+            max_steps=budget,
+            use_docker=self._use_docker,
+            step_delay=self.step_delay,
+            mode="single",
+            request_timeout=self.request_timeout,
+            max_retries=self.max_retries,
+            retry_backoff=self.retry_backoff,
+            protect_tests=self.protect_tests_mode,
+            test_patterns=self.test_patterns,
+        )
+        sub.client = self.client
+        sub.run_id = self.run_id
+        sub._is_subagent = True
+        sub.agent_id = task.agent_id or task.id[:8]
+        sub._step_totals = self._step_totals
+        sub._step_counter = StepCounter(budget, totals=self._step_totals)
+        sub._workspace_lock = self._workspace_lock
+        sub.checkpoint = self.checkpoint
+        sub.test_guard = self.test_guard
+        sub.tools = self.tools
+        return sub
+
+    def _collect_partial_notes(self) -> str:
+        """Summarize isolated context so an exhausted subtask is still useful."""
+        blobs: list[str] = []
+        for msg in self.context.messages[-8:]:
+            role = msg.get("role")
+            content = (msg.get("content") or "").strip()
+            if role in ("assistant", "tool") and content:
+                blobs.append(content[:500])
+        return "\n".join(blobs) if blobs else "(no tool output yet)"
+
+    def _dependency_context(self, scheduler: TaskScheduler, task: Task) -> str:
+        parts: list[str] = []
+        for dep_id in task.dependencies:
+            dep = scheduler.get_task(dep_id)
+            if dep is None:
+                continue
+            result = dep.result
+            if isinstance(result, dict):
+                msg = result.get("message", "")
+            else:
+                msg = "" if result is None else str(result)
+            note = " (optional; treat as hints, not requirements)" if dep.optional else ""
+            parts.append(
+                f"### {dep.description}{note}\nstatus={dep.status.value}\n{msg}"
+            )
+        return "\n\n".join(parts)
+
+    async def _coordinator_finish(self, message: str, *, success: bool) -> dict[str, Any]:
+        """Record a parent finish tool call after merging sub-agent results."""
+        rid = self._require_run_id()
+        await self.state_manager.add_event(
+            rid,
+            EventType.TOOL_CALLED,
+            {
+                "tool": "finish",
+                "arguments": {"message": message},
+                "call_id": "coordinator_finish",
+                "agent_id": "parent",
+            },
+        )
+        await self.state_manager.add_event(
+            rid,
+            EventType.TOOL_RESULT,
+            {
+                "tool_call_id": "coordinator_finish",
+                "result": {"name": "finish", "output": message},
+                "agent_id": "parent",
+            },
+        )
+        if success:
+            await self.state_manager.update_run_state(rid, AgentState.DONE)
+            return {"status": "success", "message": message}
+        await self.state_manager.update_run_state(rid, AgentState.FAILED)
+        return {"status": "failed", "message": message}
+
+    async def _run_multi(self, task: str) -> dict[str, Any]:
+        """Run independent subtasks concurrently via isolated sub-agents."""
+        rid = self._require_run_id()
+        scheduler = self._scheduler
+        if scheduler is None:
+            return {"status": "failed", "message": "No plan was produced"}
+
+        await self.state_manager.update_run_state(rid, AgentState.EXECUTING)
+        budgets = self._allocate_subtask_budgets(len(self._plan_tasks))
+        budget_by_id = {
+            planned.id: budgets[i] for i, planned in enumerate(self._plan_tasks)
+        }
+
+        async def agent_func(_executor: Any, planned: Task) -> dict[str, Any]:
+            extra = self._dependency_context(scheduler, planned)
+            sub = self._spawn_subagent(planned, budget_by_id.get(planned.id, 3))
+            return await sub.run_subtask(task, planned.description, extra)
+
+        try:
+            await scheduler.run_all(self, agent_func)
+        except Exception as exc:
+            self.current_step = self._step_totals.value
+            message = f"Scheduler error while running subtasks: {exc}"
+            await self.state_manager.add_event(
+                rid,
+                EventType.MESSAGE_ADDED,
+                {"role": "assistant", "content": message, "agent_id": "parent"},
+            )
+            return await self._coordinator_finish(message, success=False)
+
+        self.current_step = self._step_totals.value
+
+        parts: list[str] = []
+        hard_failed = False
+        for planned in self._plan_tasks:
+            if planned.status in (TaskStatus.FAILED, TaskStatus.BLOCKED) and not planned.optional:
+                hard_failed = True
+            result = planned.result if isinstance(planned.result, dict) else {}
+            msg = result.get("message", planned.error or "")
+            tag = planned.status.value
+            if result.get("partial"):
+                tag = f"{tag}, partial"
+            parts.append(f"- [{tag}] {planned.description}: {msg}")
+
+        message = "Merged sub-agent results:\n" + "\n".join(parts)
+        await self.state_manager.add_event(
+            rid,
+            EventType.MESSAGE_ADDED,
+            {"role": "assistant", "content": message, "agent_id": "parent"},
+        )
+        return await self._coordinator_finish(message, success=not hard_failed)
 
     async def _agent_loop(self) -> dict[str, Any]:
         """Main agent execution loop."""
         rid = self._require_run_id()
-        while self.current_step < self.max_steps:
+        while True:
             try:
-                await self.state_manager.update_run_state(rid, AgentState.EXECUTING)
+                step = await self._step_counter.consume()
+                if step is None:
+                    if self._is_subagent:
+                        notes = self._collect_partial_notes()
+                        return {
+                            "status": "success",
+                            "partial": True,
+                            "message": (
+                                f"Step budget ({self.max_steps}) exhausted; "
+                                f"partial findings:\n{notes}"
+                            ),
+                        }
+                    await self.state_manager.update_run_state(rid, AgentState.FAILED)
+                    return {
+                        "status": "failed",
+                        "message": f"Max steps ({self.max_steps}) reached",
+                    }
+                self.current_step = step
+                if not self._is_subagent:
+                    await self.state_manager.update_run_state(rid, AgentState.EXECUTING)
                 await self.state_manager.increment_steps(rid)
-                self.current_step += 1
 
-                await self._set_plan_status(self._plan_cursor, TaskStatus.RUNNING)
+                if not self._is_subagent:
+                    await self._set_plan_status(self._plan_cursor, TaskStatus.RUNNING)
                 if self.step_delay:
                     await asyncio.sleep(self.step_delay)
 
@@ -188,6 +512,7 @@ class CodingAgent:
                     {
                         "role": "assistant",
                         "content": message.content or "",
+                        "agent_id": self.agent_id,
                         "tool_calls": (
                             [tc.model_dump() for tc in message.tool_calls]
                             if message.tool_calls
@@ -197,7 +522,10 @@ class CodingAgent:
                 )
 
                 if message.tool_calls:
-                    await self.state_manager.update_run_state(rid, AgentState.WAITING_TOOL)
+                    if not self._is_subagent:
+                        await self.state_manager.update_run_state(
+                            rid, AgentState.WAITING_TOOL
+                        )
 
                     tool_calls_dicts = [
                         {
@@ -220,55 +548,85 @@ class CodingAgent:
                         await self.state_manager.add_event(
                             rid,
                             EventType.TOOL_RESULT,
-                            {"tool_call_id": tool_call.id, "result": result},
+                            {
+                                "tool_call_id": tool_call.id,
+                                "result": result,
+                                "agent_id": self.agent_id,
+                            },
                         )
 
                         self.context.add_tool_result(tool_call.id, json.dumps(result))
 
                         if result.get("name") == "finish":
+                            if self._is_subagent:
+                                return {
+                                    "status": "success",
+                                    "message": result.get("output", "Task completed"),
+                                }
                             for i in range(len(self._plan_tasks)):
                                 await self._set_plan_status(i, TaskStatus.COMPLETED)
-                            await self.state_manager.update_run_state(rid, AgentState.DONE)
+                            await self.state_manager.update_run_state(
+                                rid, AgentState.DONE
+                            )
                             return {
                                 "status": "success",
                                 "message": result.get("output", "Task completed"),
                             }
 
-                    sha = self.checkpoint.create_checkpoint(
-                        rid, self.current_step, "After tool execution"
-                    )
+                    async with self._workspace_lock:
+                        sha = self.checkpoint.create_checkpoint(
+                            rid, self.current_step, "After tool execution"
+                        )
                     await self.state_manager.add_event(
-                        rid, EventType.CHECKPOINT_CREATED, {"sha": sha}
+                        rid,
+                        EventType.CHECKPOINT_CREATED,
+                        {"sha": sha, "agent_id": self.agent_id},
                     )
-                    await self._set_plan_status(self._plan_cursor, TaskStatus.COMPLETED)
-                    self._plan_cursor = min(self._plan_cursor + 1, max(len(self._plan_tasks) - 1, 0))
+                    if not self._is_subagent:
+                        await self._set_plan_status(
+                            self._plan_cursor, TaskStatus.COMPLETED
+                        )
+                        self._plan_cursor = min(
+                            self._plan_cursor + 1, max(len(self._plan_tasks) - 1, 0)
+                        )
 
                 elif message.content:
                     self.context.add_message("assistant", message.content)
 
                 if response.usage:
-                    await self.state_manager.add_token_usage(rid, response.usage.total_tokens)
+                    await self.state_manager.add_token_usage(
+                        rid, response.usage.total_tokens
+                    )
 
             except Exception as e:
                 await self.state_manager.add_event(
-                    rid, EventType.ERROR, {"error": str(e), "step": self.current_step}
+                    rid,
+                    EventType.ERROR,
+                    {
+                        "error": str(e),
+                        "step": self.current_step,
+                        "agent_id": self.agent_id,
+                    },
                 )
-                await self.state_manager.update_run_state(rid, AgentState.FAILED)
+                if not self._is_subagent:
+                    await self.state_manager.update_run_state(rid, AgentState.FAILED)
                 return {"status": "failed", "message": str(e)}
 
-        await self.state_manager.update_run_state(rid, AgentState.FAILED)
-        return {"status": "failed", "message": f"Max steps ({self.max_steps}) reached"}
-
     async def _call_llm(self) -> Any:
-        """Call the LLM with current context."""
+        """Call the LLM with current context, timeout, and retries."""
         messages = self.context.get_messages()
         tools = self._get_tool_schemas()
 
-        response = await self.client.chat.completions.create(
-            model=self.model, messages=messages, tools=tools, tool_choice="auto"
+        return await create_with_retry(
+            self.client,
+            timeout=self.request_timeout,
+            max_retries=self.max_retries,
+            backoff=self.retry_backoff,
+            model=self.model,
+            messages=messages,
+            tools=tools,
+            tool_choice="auto",
         )
-
-        return response
 
     async def _execute_tool(self, tool_call: Any) -> dict[str, Any]:
         """Execute a tool call."""
@@ -279,7 +637,12 @@ class CodingAgent:
         await self.state_manager.add_event(
             rid,
             EventType.TOOL_CALLED,
-            {"tool": function_name, "arguments": arguments, "call_id": tool_call.id},
+            {
+                "tool": function_name,
+                "arguments": arguments,
+                "call_id": tool_call.id,
+                "agent_id": self.agent_id,
+            },
         )
 
         if function_name == "finish":
@@ -287,7 +650,11 @@ class CodingAgent:
 
         for tool in self.tools:
             if tool.name == function_name:
-                result = await tool.execute(**arguments)
+                if function_name in MUTATING_TOOLS:
+                    async with self._workspace_lock:
+                        result = await tool.execute(**arguments)
+                else:
+                    result = await tool.execute(**arguments)
                 return {
                     "name": function_name,
                     "success": result.success,
@@ -295,7 +662,11 @@ class CodingAgent:
                     "error": result.error,
                 }
 
-        return {"name": function_name, "success": False, "error": f"Unknown tool: {function_name}"}
+        return {
+            "name": function_name,
+            "success": False,
+            "error": f"Unknown tool: {function_name}",
+        }
 
     def _get_tool_schemas(self) -> list[dict[str, Any]]:
         """Get tool schemas for LLM."""
@@ -345,4 +716,6 @@ class CodingAgent:
                 )
             elif event.event_type == EventType.TOOL_RESULT:
                 data = event.data
-                self.context.add_tool_result(data["tool_call_id"], json.dumps(data["result"]))
+                self.context.add_tool_result(
+                    data["tool_call_id"], json.dumps(data["result"])
+                )

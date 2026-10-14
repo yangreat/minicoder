@@ -11,6 +11,7 @@ describe('App', () => {
   it('renders task input section', () => {
     render(<App />);
     expect(screen.getByText(/New Task/i)).toBeInTheDocument();
+    expect(screen.getByText(/Multi-agent/i)).toBeInTheDocument();
   });
 
   it('renders runs history section', () => {

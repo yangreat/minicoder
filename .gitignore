@@ -40,6 +40,7 @@ htmlcov/
 *.db
 benchmarks/toy_repos/**/.git/
 benchmarks/toy_repos/**/.minicoder/
+benchmarks/results/
 
 # Frontend
 web/node_modules/

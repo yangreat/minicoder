@@ -44,7 +44,7 @@ async def test_demo_agent_edits_and_rollback(calc_repo: Path) -> None:
 
         created = [e for e in events if e.event_type == EventType.TASK_CREATED]
         assert len(created) >= 2
-        assert created[1].data["subtask"]["dependencies"]
+        assert any(e.data["subtask"]["dependencies"] for e in created)
 
         source = (calc_repo / "calculator.py").read_text()
         assert "Cannot divide by zero" in source
