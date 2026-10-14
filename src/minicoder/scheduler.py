@@ -33,6 +33,8 @@ class Task:
     retries: int = 0
     max_retries: int = 3
     agent_id: str | None = None
+    kind: str = "edit"
+    optional: bool = False
 
 
 StatusCallback = Callable[[Task], Awaitable[None] | None]
@@ -62,13 +64,18 @@ class TaskScheduler:
         dependencies: list[str] | None = None,
         priority: int = 0,
         max_retries: int = 3,
+        kind: str = "edit",
+        optional: bool | None = None,
     ) -> str:
         """Add a task to the scheduler."""
+        resolved_kind = kind or "edit"
         task = Task(
             description=description,
             dependencies=set(dependencies or []),
             priority=priority,
             max_retries=max_retries,
+            kind=resolved_kind,
+            optional=resolved_kind == "read" if optional is None else optional,
         )
         self.tasks[task.id] = task
         return task.id
@@ -81,19 +88,27 @@ class TaskScheduler:
             if task.status != TaskStatus.PENDING:
                 continue
 
-            deps_satisfied = all(
-                self.tasks[dep_id].status == TaskStatus.COMPLETED for dep_id in task.dependencies
-            )
-
-            if deps_satisfied:
+            if all(self._dep_ready(dep_id) for dep_id in task.dependencies):
                 ready.append(task)
 
         return sorted(ready, key=lambda t: -t.priority)
 
+    def _dep_ready(self, dep_id: str) -> bool:
+        """Hard deps must complete; optional/read deps may fail without blocking."""
+        dep = self.tasks.get(dep_id)
+        if dep is None:
+            return True
+        if dep.status == TaskStatus.COMPLETED:
+            return True
+        if dep.optional and dep.status in (TaskStatus.FAILED, TaskStatus.BLOCKED):
+            return True
+        return False
+
     def _dependency_unsatisfiable(self, task: Task) -> bool:
-        """True if any dependency has FAILED or BLOCKED (transitively via BLOCKED)."""
+        """True if a non-optional dependency has FAILED or BLOCKED."""
         return any(
             dep in self.tasks
+            and not self.tasks[dep].optional
             and self.tasks[dep].status in (TaskStatus.FAILED, TaskStatus.BLOCKED)
             for dep in task.dependencies
         )
@@ -226,50 +241,85 @@ class Planner:
         text = task_description.lower()
 
         if "fix" in text or "bug" in text:
-            # Parallel reads, then one locate+fix worker (not a 5-step chain
-            # that starves "Apply the fix" after "Locate" burns the budget).
+            # Reads are optional context: they must not block the edit worker.
             return [
-                {"description": "Read README and project context", "priority": 3},
-                {"description": "Read failing tests", "priority": 3},
+                {
+                    "description": "Read README and project context",
+                    "priority": 3,
+                    "kind": "read",
+                    "optional": True,
+                },
+                {
+                    "description": "Read failing tests",
+                    "priority": 3,
+                    "kind": "read",
+                    "optional": True,
+                },
                 {
                     "description": "Locate the buggy code and apply the fix",
                     "priority": 1,
+                    "kind": "edit",
                     "depends_on": [0, 1],
                 },
                 {
                     "description": "Verify the fix by running tests",
                     "priority": 0,
+                    "kind": "verify",
                     "depends_on": [2],
                 },
             ]
         if "implement" in text or "add " in text:
             return [
-                {"description": "Plan the implementation approach", "priority": 3},
+                {
+                    "description": "Plan the implementation approach",
+                    "priority": 3,
+                    "kind": "read",
+                    "optional": True,
+                },
                 {
                     "description": "Implement the feature",
                     "priority": 2,
+                    "kind": "edit",
                     "depends_on": [0],
                 },
                 {
                     "description": "Add tests for the feature",
                     "priority": 2,
+                    "kind": "edit",
                     "depends_on": [0],
                 },
                 {
                     "description": "Verify implementation",
                     "priority": 0,
+                    "kind": "verify",
                     "depends_on": [1, 2],
                 },
             ]
         return [
-            {"description": "Analyze the task requirements", "priority": 2},
-            {"description": "Gather relevant context", "priority": 2},
+            {
+                "description": "Analyze the task requirements",
+                "priority": 2,
+                "kind": "read",
+                "optional": True,
+            },
+            {
+                "description": "Gather relevant context",
+                "priority": 2,
+                "kind": "read",
+                "optional": True,
+            },
             {
                 "description": "Execute the task",
                 "priority": 1,
+                "kind": "edit",
                 "depends_on": [0, 1],
             },
-            {"description": "Verify completion", "priority": 0, "depends_on": [2]},
+            {
+                "description": "Verify completion",
+                "priority": 0,
+                "kind": "verify",
+                "depends_on": [2],
+            },
         ]
 
     @staticmethod
@@ -307,6 +357,22 @@ class Planner:
         return all(count <= 1 for count in child_count.values())
 
     @staticmethod
+    def independent_edit_tasks(tasks: list[Task]) -> list[Task]:
+        """Edit tasks that do not depend on another edit (can run in parallel)."""
+        edits = [t for t in tasks if t.kind == "edit"]
+        edit_ids = {t.id for t in edits}
+        return [t for t in edits if not (t.dependencies & edit_ids)]
+
+    @staticmethod
+    def should_fallback_to_single(tasks: list[Task]) -> bool:
+        """Multi-agent is only worth it with 2+ independent edit workers."""
+        if len(tasks) <= 1:
+            return True
+        if Planner.is_pure_chain_tasks(tasks):
+            return True
+        return len(Planner.independent_edit_tasks(tasks)) < 2
+
+    @staticmethod
     def create_task_graph(
         steps: list[dict[str, Any]],
         scheduler: TaskScheduler,
@@ -319,11 +385,15 @@ class Planner:
             depends_on = step.get("depends_on", [])
             dep_ids = [task_ids[idx] for idx in depends_on if idx < len(task_ids)]
 
+            kind = str(step.get("kind") or "edit")
+            optional = step.get("optional")
             task_id = scheduler.add_task(
                 description=step["description"],
                 dependencies=dep_ids,
                 priority=step.get("priority", 0),
                 max_retries=step.get("max_retries", max_retries),
+                kind=kind,
+                optional=bool(optional) if optional is not None else None,
             )
             task_ids.append(task_id)
 

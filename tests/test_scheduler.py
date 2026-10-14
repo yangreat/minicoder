@@ -105,6 +105,26 @@ async def test_failed_subtask_is_retried() -> None:
     assert statuses["a"] == TaskStatus.COMPLETED
 
 
+@pytest.mark.asyncio
+async def test_optional_failed_dependency_does_not_block() -> None:
+    scheduler = TaskScheduler(max_parallel=2)
+    a = scheduler.add_task("read", max_retries=0, kind="read", optional=True)
+    scheduler.add_task("fix", dependencies=[a], max_retries=0, kind="edit")
+    order: list[str] = []
+
+    async def agent_func(_executor: object, task: Task) -> dict[str, str]:
+        order.append(task.description)
+        if task.description == "read":
+            return {"status": "failed", "message": "Max steps reached"}
+        return {"status": "success", "message": "ok"}
+
+    await scheduler.run_all(None, agent_func)
+    statuses = {t.description: t.status for t in scheduler.tasks.values()}
+    assert statuses["read"] == TaskStatus.FAILED
+    assert statuses["fix"] == TaskStatus.COMPLETED
+    assert order == ["read", "fix"]
+
+
 def test_planner_is_pure_chain() -> None:
     chain = [
         {"description": "a"},
@@ -123,8 +143,20 @@ def test_planner_fix_template_has_parallel_roots() -> None:
     steps = Planner.decompose_coding_task("Fix the bug in calculator.py")
     roots = [s for s in steps if not s.get("depends_on")]
     assert len(roots) >= 2
+    assert all(s.get("kind") == "read" for s in roots)
     scheduler = TaskScheduler()
     ids = Planner.create_task_graph(steps, scheduler)
     assert len(ids) == len(steps)
     ready = scheduler.get_ready_tasks()
     assert len(ready) >= 2
+    assert Planner.should_fallback_to_single(list(scheduler.tasks.values()))
+    assert len(Planner.independent_edit_tasks(list(scheduler.tasks.values()))) == 1
+
+
+def test_implement_plan_has_two_independent_edits() -> None:
+    steps = Planner.decompose_coding_task("Implement the feature")
+    scheduler = TaskScheduler()
+    Planner.create_task_graph(steps, scheduler)
+    tasks = list(scheduler.tasks.values())
+    assert len(Planner.independent_edit_tasks(tasks)) == 2
+    assert not Planner.should_fallback_to_single(tasks)

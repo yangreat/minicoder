@@ -391,8 +391,8 @@ ruff check src/minicoder tests --fix
 
 2026-10-14 在 DashScope 上对 PR #2 分支（`cc3079d`）做了实测，**完整表格、命令和注释见 [docs/eval-results.md](docs/eval-results.md)**（原文照录，未改数字）。
 
-- **single**：qwen3.6-plus 三档压缩各 30/30，qwen-plus default 20/20，测试通过率 100%。
-- **multi**：当时还没有本次的分步预算 / 链式回退 / coordinator `finish`；调度器死锁是在本地打了 `local_fix.patch` 之后才跑完的。qwen3.6-plus 22/30，qwen-plus 3/20，且 **0/50 次调用 finish**。不要把这些 multi 数字当成当前代码的结果。
+- **v2（`cc3079d` + 本地 scheduler 补丁）single**：qwen3.6-plus 三档压缩各 30/30，qwen-plus default 20/20，测试通过率 100%。**multi**：qwen3.6-plus 22/30，qwen-plus 3/20，且 **0/50 次调用 finish**。
+- **v3（`425af4a`）**：死锁已消失；single 仍 10/10。**multi 回退**：qwen3.6-plus 2/30，qwen-plus 0/20，finish 1/50。原因是并行 read 子任务 3 步耗尽后失败，卡住 locate+apply。不要把 v2/v3 的 multi 数字当成后续提交的结果。
 
 ### 🗺️ 路线图
 
@@ -751,8 +751,8 @@ ruff check src/minicoder tests --fix
 
 DashScope numbers from 2026-10-14 on PR #2 (`cc3079d`) are recorded verbatim in [docs/eval-results.md](docs/eval-results.md). No new figures are invented here.
 
-- **single**: qwen3.6-plus 30/30 on each compression preset; qwen-plus default 20/20 (100% tests pass).
-- **multi**: measured *before* the per-subtask budgets / chain fallback / coordinator `finish` in this follow-up, and *after* a local scheduler hang fix (`local_fix.patch`). qwen3.6-plus 22/30, qwen-plus 3/20, and **finish was never called (0/50)**. Do not treat those multi rows as results for the current code.
+- **v2 (`cc3079d` + local scheduler patch) single**: qwen3.6-plus 30/30 on each compression preset; qwen-plus default 20/20. **multi**: qwen3.6-plus 22/30, qwen-plus 3/20, finish 0/50.
+- **v3 (`425af4a`)**: deadlock gone; single still 10/10. **multi regressed** to qwen3.6-plus 2/30, qwen-plus 0/20, finish 1/50, because parallel read subtasks exhausted a 3-step budget and blocked locate+apply. Do not treat v2/v3 multi rows as results for later commits.
 
 ### 🗺️ Roadmap
 

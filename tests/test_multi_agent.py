@@ -4,12 +4,15 @@ from __future__ import annotations
 
 import asyncio
 import json
+from collections.abc import Iterator
+from contextlib import contextmanager
 from pathlib import Path
 
 import pytest
 
 from minicoder.agent import CodingAgent
 from minicoder.mock_llm import MockOpenAI, MockResponse, MockToolCall
+from minicoder.scheduler import Planner, Task
 from minicoder.state import EventType, StateManager
 
 
@@ -28,6 +31,36 @@ def _finish_responses(n: int) -> list[MockResponse]:
     ]
 
 
+def _finish(msg: str, call_id: str = "f") -> MockResponse:
+    return MockResponse(
+        tool_calls=[
+            MockToolCall(
+                id=call_id,
+                function_name="finish",
+                arguments=json.dumps({"message": msg}),
+            )
+        ]
+    )
+
+
+@contextmanager
+def _force_multi() -> Iterator[None]:
+    """Run the DAG even when the plan has fewer than 2 independent edits."""
+    orig = Planner.should_fallback_to_single
+    Planner.should_fallback_to_single = staticmethod(lambda _tasks: False)  # type: ignore[method-assign]
+    try:
+        yield
+    finally:
+        Planner.should_fallback_to_single = orig  # type: ignore[method-assign]
+
+
+def _user_blob(kwargs: object) -> str:
+    messages = []
+    if isinstance(kwargs, dict):
+        messages = kwargs.get("messages") or []
+    return "\n".join(m.get("content") or "" for m in messages if m.get("role") == "user")
+
+
 @pytest.mark.asyncio
 async def test_multi_agent_emits_plan_and_merges(tmp_path: Path) -> None:
     db_path = tmp_path / "t.db"
@@ -36,7 +69,7 @@ async def test_multi_agent_emits_plan_and_merges(tmp_path: Path) -> None:
     try:
         agent = CodingAgent(tmp_path, sm, max_steps=20, mode="multi", max_parallel=3)
         agent.client = MockOpenAI(_finish_responses(20))
-        result = await agent.run("Fix the bug in this repository")
+        result = await agent.run("Implement the feature in this repository")
         assert result["status"] == "success"
         assert "Merged sub-agent results" in result["message"]
 
@@ -83,7 +116,7 @@ async def test_multi_agent_runs_independent_subtasks_concurrently(tmp_path: Path
 
         agent = CodingAgent(tmp_path, sm, max_steps=20, mode="multi", max_parallel=3)
         agent.client = mock
-        result = await agent.run("Fix the bug")
+        result = await agent.run("Implement the feature")
         assert result["status"] == "success"
         assert max_flight >= 2
     finally:
@@ -99,16 +132,12 @@ async def test_subagents_have_isolated_context(tmp_path: Path) -> None:
         mock = MockOpenAI(_finish_responses(20))
         agent = CodingAgent(tmp_path, sm, max_steps=20, mode="multi")
         agent.client = mock
-        await agent.run("Fix the bug in the repo")
+        await agent.run("Implement the feature in the repo")
         user_blobs = []
         for call in mock.chat.completions.calls:
-            messages = call.get("messages") or []
-            user_blobs.append(
-                "\n".join(m.get("content") or "" for m in messages if m.get("role") == "user")
-            )
-        # Distinct subtask descriptions land in distinct isolated contexts.
-        assert any("Read README" in blob for blob in user_blobs)
-        assert any("Read failing tests" in blob for blob in user_blobs)
+            user_blobs.append(_user_blob(call))
+        assert any("Implement the feature" in blob for blob in user_blobs)
+        assert any("Add tests for the feature" in blob for blob in user_blobs)
         assert len(user_blobs) >= 2
     finally:
         await sm.close()
@@ -122,7 +151,7 @@ async def test_coordinator_calls_finish_after_merge(tmp_path: Path) -> None:
     try:
         agent = CodingAgent(tmp_path, sm, max_steps=16, mode="multi")
         agent.client = MockOpenAI(_finish_responses(20))
-        result = await agent.run("Fix the bug")
+        result = await agent.run("Implement the feature")
         assert result["status"] == "success"
         events = await sm.get_events(result["run_id"])
         parent_finish = [
@@ -138,44 +167,44 @@ async def test_coordinator_calls_finish_after_merge(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
-async def test_per_subtask_budgets_do_not_starve_later_tasks(tmp_path: Path) -> None:
+async def test_edit_subtasks_get_most_of_the_step_budget(tmp_path: Path) -> None:
     db_path = tmp_path / "t.db"
     sm = StateManager(db_path)
     await sm.initialize()
     try:
-        agent = CodingAgent(tmp_path, sm, max_steps=8, mode="multi")
-        seen: list[int] = []
+        agent = CodingAgent(tmp_path, sm, max_steps=15, mode="multi")
+        seen: list[tuple[str, int]] = []
         orig = agent._spawn_subagent
 
-        def spawn(task: object, budget: int):  # type: ignore[no-untyped-def]
-            seen.append(budget)
-            return orig(task, budget)  # type: ignore[arg-type]
+        def spawn(task: Task, budget: int) -> CodingAgent:
+            seen.append((task.description, budget))
+            return orig(task, budget)
 
         agent._spawn_subagent = spawn  # type: ignore[method-assign]
         agent.client = MockOpenAI(_finish_responses(20))
-        result = await agent.run("Fix the bug")
+        with _force_multi():
+            result = await agent.run("Fix the bug")
         assert result["status"] == "success"
-        assert seen, "sub-agents must be spawned with budgets"
-        assert all(b >= 1 for b in seen)
-        assert min(seen) >= 1
-        # Later workers (deps) should get a share, not zero leftover.
-        assert max(seen) >= min(seen)
+        by_desc = {desc: budget for desc, budget in seen}
+        read_budgets = [b for d, b in seen if d.startswith("Read")]
+        edit_budget = by_desc.get("Locate the buggy code and apply the fix", 0)
+        assert read_budgets
+        assert edit_budget > max(read_budgets)
+        assert edit_budget >= sum(read_budgets)
     finally:
         await sm.close()
 
 
 @pytest.mark.asyncio
-async def test_failed_subtasks_reported_and_finish_still_called(tmp_path: Path) -> None:
+async def test_exhausted_reads_do_not_fail_the_run(tmp_path: Path) -> None:
     db_path = tmp_path / "t.db"
     sm = StateManager(db_path)
     await sm.initialize()
     try:
-        # Content-only mock: sub-agents never call finish, hit per-task caps.
-        agent = CodingAgent(tmp_path, sm, max_steps=4, mode="multi", max_parallel=2)
+        agent = CodingAgent(tmp_path, sm, max_steps=8, mode="multi", max_parallel=2)
         agent.client = MockOpenAI([])
-        result = await asyncio.wait_for(agent.run("Fix the bug"), timeout=5)
-        assert result["status"] == "failed"
-        assert "Merged sub-agent results" in result["message"]
+        with _force_multi():
+            result = await asyncio.wait_for(agent.run("Fix the bug"), timeout=5)
         events = await sm.get_events(result["run_id"])
         assert any(
             e.event_type == EventType.TOOL_CALLED
@@ -183,9 +212,69 @@ async def test_failed_subtasks_reported_and_finish_still_called(tmp_path: Path) 
             and e.data.get("agent_id") == "parent"
             for e in events
         )
-        changed = [e for e in events if e.event_type == EventType.TASK_STATUS_CHANGED]
-        assert any(e.data.get("new_status") == "failed" for e in changed)
-        assert any(e.data.get("new_status") == "blocked" for e in changed)
+        assert "Merged sub-agent results" in result["message"]
+        assert "[blocked]" not in result["message"]
+    finally:
+        await sm.close()
+
+
+@pytest.mark.asyncio
+async def test_v3_plan_shape_fix_still_runs_when_reads_exhaust(tmp_path: Path) -> None:
+    """Reproduce 425af4a: [read README] || [read tests] → locate+apply → verify.
+
+    Reads never call finish (content-only, they burn their small budget). The
+    locate+apply worker must still run instead of being BLOCKED.
+    """
+    db_path = tmp_path / "t.db"
+    sm = StateManager(db_path)
+    await sm.initialize()
+    try:
+        mock = MockOpenAI([])
+        ran_fix = {"n": 0}
+
+        async def create(**kwargs: object) -> MockResponse:
+            blob = _user_blob(kwargs)
+            if "Locate the buggy code and apply the fix" in blob:
+                ran_fix["n"] += 1
+                return _finish("patched", "fix")
+            if "Verify the fix" in blob:
+                return _finish("verified", "ver")
+            return MockResponse(content="still reading files...")
+
+        mock.chat.completions.create = create  # type: ignore[method-assign]
+        agent = CodingAgent(tmp_path, sm, max_steps=15, mode="multi", max_parallel=3)
+        agent.client = mock
+        with _force_multi():
+            result = await asyncio.wait_for(
+                agent.run("Fix the bug in this repository"), timeout=8
+            )
+        assert ran_fix["n"] >= 1, "locate+apply subtask must still run"
+        assert "Locate the buggy code and apply the fix" in result["message"]
+        assert "[blocked] Locate" not in result["message"]
+        events = await sm.get_events(result["run_id"])
+        assert any(
+            e.event_type == EventType.TOOL_CALLED
+            and e.data.get("tool") == "finish"
+            and e.data.get("agent_id") == "parent"
+            for e in events
+        )
+    finally:
+        await sm.close()
+
+
+@pytest.mark.asyncio
+async def test_fix_plan_falls_back_to_single(tmp_path: Path) -> None:
+    db_path = tmp_path / "t.db"
+    sm = StateManager(db_path)
+    await sm.initialize()
+    try:
+        agent = CodingAgent(tmp_path, sm, max_steps=5, mode="multi")
+        agent.client = MockOpenAI(_finish_responses(3))
+        result = await agent.run("Fix the bug")
+        assert result["status"] == "success"
+        assert agent._fell_back_to_single is True
+        user_blobs = [_user_blob(call) for call in agent.client.chat.completions.calls]
+        assert not any("Your subtask" in blob for blob in user_blobs)
     finally:
         await sm.close()
 
@@ -196,14 +285,12 @@ async def test_pure_chain_falls_back_to_single(tmp_path: Path) -> None:
     sm = StateManager(db_path)
     await sm.initialize()
     try:
-        from minicoder.scheduler import Planner
-
         orig = Planner.decompose_coding_task
         Planner.decompose_coding_task = staticmethod(  # type: ignore[method-assign]
             lambda _task: [
-                {"description": "Step A"},
-                {"description": "Step B", "depends_on": [0]},
-                {"description": "Step C", "depends_on": [1]},
+                {"description": "Step A", "kind": "edit"},
+                {"description": "Step B", "kind": "edit", "depends_on": [0]},
+                {"description": "Step C", "kind": "edit", "depends_on": [1]},
             ]
         )
         try:
@@ -212,16 +299,7 @@ async def test_pure_chain_falls_back_to_single(tmp_path: Path) -> None:
             result = await agent.run("Do the chain")
             assert result["status"] == "success"
             assert agent._fell_back_to_single is True
-            user_blobs = []
-            for call in agent.client.chat.completions.calls:
-                messages = call.get("messages") or []
-                user_blobs.append(
-                    "\n".join(
-                        m.get("content") or ""
-                        for m in messages
-                        if m.get("role") == "user"
-                    )
-                )
+            user_blobs = [_user_blob(call) for call in agent.client.chat.completions.calls]
             assert not any("Your subtask" in blob for blob in user_blobs)
         finally:
             Planner.decompose_coding_task = orig  # type: ignore[method-assign]

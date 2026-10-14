@@ -156,7 +156,9 @@ class CodingAgent:
         self.context.add_message("system", system_prompt)
         self.context.add_message("user", task)
 
-        if self.mode == "multi" and not Planner.is_pure_chain_tasks(self._plan_tasks):
+        if self.mode == "multi" and not Planner.should_fallback_to_single(
+            self._plan_tasks
+        ):
             result = await self._run_multi(task)
         else:
             if self.mode == "multi":
@@ -167,8 +169,8 @@ class CodingAgent:
                     {
                         "role": "system",
                         "content": (
-                            "Plan is a pure dependency chain with no independent "
-                            "subtasks; falling back to single-agent mode."
+                            "Plan has fewer than 2 independent edit subtasks "
+                            "(or is a pure chain); falling back to single-agent mode."
                         ),
                         "agent_id": "parent",
                     },
@@ -296,29 +298,36 @@ class CodingAgent:
         )
 
     def _allocate_subtask_budgets(self, n: int) -> list[int]:
-        """Split the run step cap across subtasks so later workers are not starved.
-
-        Independent (no-dep) tasks get the base share; leftover steps go to
-        tasks that have dependencies (locate/fix/verify).
-        """
+        """Split the run step cap by subtask kind: edits get most of the steps."""
         n = max(n, 1)
-        base = max(1, self.max_steps // n)
-        if self.max_steps >= 3 * n:
-            base = max(3, base)
-        budgets = [base] * n
+        kinds = [t.kind or "edit" for t in self._plan_tasks] or ["edit"] * n
+        weights = {"read": 1, "verify": 2, "edit": 5}
+        wlist = [weights.get(k, 2) for k in kinds]
+        total_w = sum(wlist) or 1
+        budgets = [max(1, (self.max_steps * w) // total_w) for w in wlist]
+
+        def shrink_order() -> list[int]:
+            order: list[int] = []
+            for kind in ("read", "verify", "edit"):
+                order.extend(i for i, k in enumerate(kinds) if k == kind)
+            return order or list(range(n))
+
+        while sum(budgets) > self.max_steps:
+            reduced = False
+            for i in shrink_order():
+                if budgets[i] > 1:
+                    budgets[i] -= 1
+                    reduced = True
+                    break
+            if not reduced:
+                break
         remainder = max(0, self.max_steps - sum(budgets))
-        workers = [
-            i
-            for i, task in enumerate(self._plan_tasks)
-            if task.dependencies
-        ]
-        if not workers:
-            workers = list(range(n))
-        w = 0
+        edit_idx = [i for i, k in enumerate(kinds) if k == "edit"] or list(range(n))
+        e = 0
         while remainder > 0:
-            budgets[workers[w % len(workers)]] += 1
+            budgets[edit_idx[e % len(edit_idx)]] += 1
             remainder -= 1
-            w += 1
+            e += 1
         return budgets
 
     def _spawn_subagent(self, task: Task, budget: int) -> CodingAgent:
@@ -351,6 +360,16 @@ class CodingAgent:
         sub.tools = self.tools
         return sub
 
+    def _collect_partial_notes(self) -> str:
+        """Summarize isolated context so an exhausted subtask is still useful."""
+        blobs: list[str] = []
+        for msg in self.context.messages[-8:]:
+            role = msg.get("role")
+            content = (msg.get("content") or "").strip()
+            if role in ("assistant", "tool") and content:
+                blobs.append(content[:500])
+        return "\n".join(blobs) if blobs else "(no tool output yet)"
+
     def _dependency_context(self, scheduler: TaskScheduler, task: Task) -> str:
         parts: list[str] = []
         for dep_id in task.dependencies:
@@ -362,7 +381,10 @@ class CodingAgent:
                 msg = result.get("message", "")
             else:
                 msg = "" if result is None else str(result)
-            parts.append(f"### {dep.description}\nstatus={dep.status.value}\n{msg}")
+            note = " (optional; treat as hints, not requirements)" if dep.optional else ""
+            parts.append(
+                f"### {dep.description}{note}\nstatus={dep.status.value}\n{msg}"
+            )
         return "\n\n".join(parts)
 
     async def _coordinator_finish(self, message: str, *, success: bool) -> dict[str, Any]:
@@ -411,17 +433,31 @@ class CodingAgent:
             sub = self._spawn_subagent(planned, budget_by_id.get(planned.id, 3))
             return await sub.run_subtask(task, planned.description, extra)
 
-        await scheduler.run_all(self, agent_func)
+        try:
+            await scheduler.run_all(self, agent_func)
+        except Exception as exc:
+            self.current_step = self._step_totals.value
+            message = f"Scheduler error while running subtasks: {exc}"
+            await self.state_manager.add_event(
+                rid,
+                EventType.MESSAGE_ADDED,
+                {"role": "assistant", "content": message, "agent_id": "parent"},
+            )
+            return await self._coordinator_finish(message, success=False)
+
         self.current_step = self._step_totals.value
 
         parts: list[str] = []
-        any_failed = False
+        hard_failed = False
         for planned in self._plan_tasks:
-            if planned.status in (TaskStatus.FAILED, TaskStatus.BLOCKED):
-                any_failed = True
+            if planned.status in (TaskStatus.FAILED, TaskStatus.BLOCKED) and not planned.optional:
+                hard_failed = True
             result = planned.result if isinstance(planned.result, dict) else {}
             msg = result.get("message", planned.error or "")
-            parts.append(f"- [{planned.status.value}] {planned.description}: {msg}")
+            tag = planned.status.value
+            if result.get("partial"):
+                tag = f"{tag}, partial"
+            parts.append(f"- [{tag}] {planned.description}: {msg}")
 
         message = "Merged sub-agent results:\n" + "\n".join(parts)
         await self.state_manager.add_event(
@@ -429,7 +465,7 @@ class CodingAgent:
             EventType.MESSAGE_ADDED,
             {"role": "assistant", "content": message, "agent_id": "parent"},
         )
-        return await self._coordinator_finish(message, success=not any_failed)
+        return await self._coordinator_finish(message, success=not hard_failed)
 
     async def _agent_loop(self) -> dict[str, Any]:
         """Main agent execution loop."""
@@ -438,10 +474,17 @@ class CodingAgent:
             try:
                 step = await self._step_counter.consume()
                 if step is None:
-                    if not self._is_subagent:
-                        await self.state_manager.update_run_state(
-                            rid, AgentState.FAILED
-                        )
+                    if self._is_subagent:
+                        notes = self._collect_partial_notes()
+                        return {
+                            "status": "success",
+                            "partial": True,
+                            "message": (
+                                f"Step budget ({self.max_steps}) exhausted; "
+                                f"partial findings:\n{notes}"
+                            ),
+                        }
+                    await self.state_manager.update_run_state(rid, AgentState.FAILED)
                     return {
                         "status": "failed",
                         "message": f"Max steps ({self.max_steps}) reached",
