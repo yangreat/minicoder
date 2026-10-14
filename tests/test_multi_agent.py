@@ -43,6 +43,52 @@ def _finish(msg: str, call_id: str = "f") -> MockResponse:
     )
 
 
+def _plan_response(subtasks: list[dict[object, object]], call_id: str = "plan") -> MockResponse:
+    return MockResponse(
+        tool_calls=[
+            MockToolCall(
+                id=call_id,
+                function_name="emit_plan",
+                arguments=json.dumps({"subtasks": subtasks}),
+            )
+        ]
+    )
+
+
+def _is_planner_call(kwargs: object) -> bool:
+    messages = []
+    if isinstance(kwargs, dict):
+        messages = kwargs.get("messages") or []
+    blob = "\n".join(m.get("content") or "" for m in messages)
+    return "MiniCoder's planner" in blob or "emit_plan" in blob
+
+
+def _write(path: str, content: str, call_id: str = "w") -> MockResponse:
+    return MockResponse(
+        tool_calls=[
+            MockToolCall(
+                id=call_id,
+                function_name="write_file",
+                arguments=json.dumps({"path": path, "content": content}),
+            )
+        ]
+    )
+
+
+def _seed_two_bug_repo(root: Path) -> None:
+    (root / "pricing.py").write_text("def apply_discount(price, pct):\n    return 0\n")
+    (root / "shipping.py").write_text("def shipping_cost(weight_kg):\n    return 0\n")
+    (root / "test_pricing.py").write_text(
+        "from pricing import apply_discount\n"
+        "def test_discount():\n    assert apply_discount(200, 25) == 150.0\n"
+    )
+    (root / "test_shipping.py").write_text(
+        "from shipping import shipping_cost\n"
+        "def test_light():\n    assert shipping_cost(1) == 5.0\n"
+    )
+    (root / "README.md").write_text("two independent bugs\n")
+
+
 @contextmanager
 def _force_multi() -> Iterator[None]:
     """Run the DAG even when the plan has fewer than 2 independent edits."""
@@ -204,7 +250,7 @@ async def test_exhausted_reads_do_not_fail_the_run(tmp_path: Path) -> None:
         agent = CodingAgent(tmp_path, sm, max_steps=8, mode="multi", max_parallel=2)
         agent.client = MockOpenAI([])
         with _force_multi():
-            result = await asyncio.wait_for(agent.run("Fix the bug"), timeout=5)
+            result = await asyncio.wait_for(agent.run("Fix the bug"), timeout=15)
         events = await sm.get_events(result["run_id"])
         assert any(
             e.event_type == EventType.TOOL_CALLED
@@ -246,7 +292,7 @@ async def test_v3_plan_shape_fix_still_runs_when_reads_exhaust(tmp_path: Path) -
         agent.client = mock
         with _force_multi():
             result = await asyncio.wait_for(
-                agent.run("Fix the bug in this repository"), timeout=8
+                agent.run("Fix the bug in this repository"), timeout=15
             )
         assert ran_fix["n"] >= 1, "locate+apply subtask must still run"
         assert "Locate the buggy code and apply the fix" in result["message"]
@@ -303,6 +349,200 @@ async def test_pure_chain_falls_back_to_single(tmp_path: Path) -> None:
             assert not any("Your subtask" in blob for blob in user_blobs)
         finally:
             Planner.decompose_coding_task = orig  # type: ignore[method-assign]
+    finally:
+        await sm.close()
+
+
+@pytest.mark.asyncio
+async def test_llm_planner_two_scoped_edits_run_in_parallel(tmp_path: Path) -> None:
+    _seed_two_bug_repo(tmp_path)
+    db_path = tmp_path / "t.db"
+    sm = StateManager(db_path)
+    await sm.initialize()
+    try:
+        plan = [
+            {
+                "id": "pricing",
+                "description": "Fix apply_discount in pricing.py",
+                "kind": "edit",
+                "files": ["pricing.py"],
+                "failing_tests": ["test_pricing.py"],
+            },
+            {
+                "id": "shipping",
+                "description": "Fix shipping_cost in shipping.py",
+                "kind": "edit",
+                "files": ["shipping.py"],
+                "failing_tests": ["test_shipping.py"],
+            },
+        ]
+        mock = MockOpenAI(_finish_responses(30))
+        orig = mock.chat.completions.create
+        in_flight = 0
+        max_flight = 0
+        lock = asyncio.Lock()
+        worker_blobs: list[str] = []
+
+        async def create(**kwargs: object) -> MockResponse:
+            nonlocal in_flight, max_flight
+            if _is_planner_call(kwargs):
+                return _plan_response(plan)
+            blob = _user_blob(kwargs)
+            worker_blobs.append(blob)
+            async with lock:
+                in_flight += 1
+                max_flight = max(max_flight, in_flight)
+            try:
+                await asyncio.sleep(0.12)
+                return await orig(**kwargs)
+            finally:
+                async with lock:
+                    in_flight -= 1
+
+        mock.chat.completions.create = create  # type: ignore[method-assign]
+        agent = CodingAgent(tmp_path, sm, max_steps=20, mode="multi", max_parallel=3)
+        agent.client = mock
+        result = await agent.run("Fix the bugs in this repository")
+        assert result["status"] == "success"
+        assert result["true_multi"] is True
+        assert result["fell_back_to_single"] is False
+        assert result["plan_source"] == "llm"
+        assert max_flight >= 2
+        pricing_blobs = [b for b in worker_blobs if "Fix apply_discount" in b]
+        shipping_blobs = [b for b in worker_blobs if "Fix shipping_cost" in b]
+        assert pricing_blobs
+        assert shipping_blobs
+        assert any("File in your scope: pricing.py" in b for b in pricing_blobs)
+        assert not any("File in your scope: shipping.py" in b for b in pricing_blobs)
+        assert any("File in your scope: shipping.py" in b for b in shipping_blobs)
+        worker_descs = {w["description"] for w in result["worker_stats"] if w["kind"] == "edit"}
+        assert "Fix apply_discount in pricing.py" in worker_descs
+        assert "Fix shipping_cost in shipping.py" in worker_descs
+        assert all("steps" in w and "tokens" in w for w in result["worker_stats"])
+    finally:
+        await sm.close()
+
+
+@pytest.mark.asyncio
+async def test_llm_plan_one_edit_falls_back_to_single(tmp_path: Path) -> None:
+    db_path = tmp_path / "t.db"
+    sm = StateManager(db_path)
+    await sm.initialize()
+    try:
+        mock = MockOpenAI(_finish_responses(10))
+        orig = mock.chat.completions.create
+
+        async def create(**kwargs: object) -> MockResponse:
+            if _is_planner_call(kwargs):
+                return _plan_response(
+                    [
+                        {
+                            "description": "Fix the only bug",
+                            "kind": "edit",
+                            "files": ["app.py"],
+                        }
+                    ]
+                )
+            return await orig(**kwargs)
+
+        mock.chat.completions.create = create  # type: ignore[method-assign]
+        agent = CodingAgent(tmp_path, sm, max_steps=8, mode="multi")
+        agent.client = mock
+        result = await agent.run("Fix the bug")
+        assert result["status"] == "success"
+        assert result["fell_back_to_single"] is True
+        assert result["true_multi"] is False
+        assert result["plan_source"] == "llm"
+        user_blobs = [_user_blob(call) for call in mock.chat.completions.calls]
+        assert not any("Your subtask" in blob for blob in user_blobs)
+    finally:
+        await sm.close()
+
+
+@pytest.mark.asyncio
+async def test_invalid_plan_json_uses_keyword_fallback(tmp_path: Path) -> None:
+    db_path = tmp_path / "t.db"
+    sm = StateManager(db_path)
+    await sm.initialize()
+    try:
+        mock = MockOpenAI(_finish_responses(10))
+        orig = mock.chat.completions.create
+
+        async def create(**kwargs: object) -> MockResponse:
+            if _is_planner_call(kwargs):
+                return MockResponse(content="{this is not json")
+            return await orig(**kwargs)
+
+        mock.chat.completions.create = create  # type: ignore[method-assign]
+        agent = CodingAgent(tmp_path, sm, max_steps=8, mode="multi")
+        agent.client = mock
+        result = await agent.run("Fix the bug")
+        assert result["status"] == "success"
+        assert result["plan_source"] == "keyword"
+        assert result["fell_back_to_single"] is True
+        assert "LLM plan invalid" in (agent._plan_error or "")
+    finally:
+        await sm.close()
+
+
+@pytest.mark.asyncio
+async def test_file_conflict_serialized_and_recorded(tmp_path: Path) -> None:
+    db_path = tmp_path / "t.db"
+    sm = StateManager(db_path)
+    await sm.initialize()
+    try:
+        (tmp_path / "shared.py").write_text("old\n")
+        writes: dict[str, int] = {"a": 0, "b": 0}
+        mock = MockOpenAI([])
+        in_flight = 0
+        max_flight = 0
+        lock = asyncio.Lock()
+
+        async def create(**kwargs: object) -> MockResponse:
+            nonlocal in_flight, max_flight
+            if _is_planner_call(kwargs):
+                return _plan_response(
+                    [
+                        {
+                            "id": "a",
+                            "description": "Worker A edits shared.py",
+                            "kind": "edit",
+                            "files": ["shared.py"],
+                        },
+                        {
+                            "id": "b",
+                            "description": "Worker B edits shared.py",
+                            "kind": "edit",
+                            "files": ["shared.py"],
+                        },
+                    ]
+                )
+            blob = _user_blob(kwargs)
+            worker = "a" if "Worker A" in blob else "b"
+            async with lock:
+                in_flight += 1
+                max_flight = max(max_flight, in_flight)
+            try:
+                await asyncio.sleep(0.08)
+                if writes[worker] == 0:
+                    writes[worker] += 1
+                    return _write("shared.py", worker + "\n", call_id=f"{worker}-w")
+                return _finish(f"done-{worker}", call_id=f"{worker}-f")
+            finally:
+                async with lock:
+                    in_flight -= 1
+
+        mock.chat.completions.create = create  # type: ignore[method-assign]
+        agent = CodingAgent(tmp_path, sm, max_steps=16, mode="multi", max_parallel=3)
+        agent.client = mock
+        result = await asyncio.wait_for(
+            agent.run("Fix two workers on the same file"), timeout=8
+        )
+        assert result["status"] == "success"
+        assert result["true_multi"] is True
+        assert (tmp_path / "shared.py").exists()
+        assert result["file_conflicts"] or agent._file_locks.conflicts
+        assert max_flight >= 2
     finally:
         await sm.close()
 

@@ -121,7 +121,7 @@ MiniCoder 提供了一个现代化的 Web 控制台，使用 **React + TypeScrip
   
 - ⚠️ **权衡**：
   - 增加系统复杂度
-  - 需要仔细管理共享状态（通过 asyncio.Semaphore 限制并发）
+  - 需要仔细管理共享状态（文件级锁避免两个 worker 同时改同一文件；独立编辑仍可并行）
 
 #### 3. 上下文管理：固定窗口 vs 智能压缩
 
@@ -238,7 +238,7 @@ minicoder run "添加输入验证" --repo /path/to/repo
 # 使用 Docker 沙箱
 minicoder run "运行危险脚本" --docker
 
-# 多代理（planner 分解 + 并发子代理）
+# 多代理（仓库探索 + LLM JSON 计划 + 按文件划分的并发 worker）
 minicoder run "修复这个 bug" --mode multi --max-parallel 3
 
 # 禁止改测试文件
@@ -262,7 +262,7 @@ minicoder serve --port 8000
 
 ### 🧪 评估
 
-内置 `benchmarks/toy_repos/` 目前有约 10 个故意失败的玩具仓库（含多文件任务）。评测会把每个任务复制到临时目录、运行代理、**用原始测试文件打分**（代理改测试不算通过），并写出 JSON + Markdown。
+内置 `benchmarks/toy_repos/` 目前有 13 个故意失败的玩具仓库：10 个单 bug 任务，以及 3 个 `twofix_*`（两个无关模块各有一个 bug，测试在修复前必须失败）。评测会把每个任务复制到临时目录、运行代理、**用原始测试文件打分**（代理改测试不算通过），并写出 JSON + Markdown。
 
 针对 OpenAI 兼容接口的评测命令：
 
@@ -283,7 +283,7 @@ python benchmarks/evaluate.py \
 常用开关：
 
 - `--compression {default,off,aggressive}`：上下文压缩强度
-- `--agent-mode {single,multi}`：单代理循环或多代理（planner 分解 + 并发子代理）
+- `--agent-mode {single,multi}`：单代理循环，或多代理（先探索仓库再让 LLM 输出带 schema 的 JSON 计划；少于 2 个独立 edit 子任务或计划无效则回退到单代理；关键词模板只作最后兜底）
 - `--repeats N`：每任务重复次数（报告 mean ± stdev）
 - `--protect-tests {block,flag,off}`：评测默认 `block`，禁止改测试文件
 - `--request-timeout` / `--max-retries`：LLM 请求超时与退避重试（也可用 `MINICODER_REQUEST_TIMEOUT`、`MINICODER_MAX_RETRIES`）
@@ -334,6 +334,7 @@ agent = CodingAgent(
 - 工具调用次数
 - 成功/失败状态
 - 完整事件日志
+- multi 模式下：是否 true-multi / 是否回退单代理、每个 worker 的 steps/tokens（写入 `results.json`，worker 结果不再截断到 500 字符）
 
 查询指标：
 
@@ -393,6 +394,8 @@ ruff check src/minicoder tests --fix
 
 - **v2（`cc3079d` + 本地 scheduler 补丁）single**：qwen3.6-plus 三档压缩各 30/30，qwen-plus default 20/20，测试通过率 100%。**multi**：qwen3.6-plus 22/30，qwen-plus 3/20，且 **0/50 次调用 finish**。
 - **v3（`425af4a`）**：死锁已消失；single 仍 10/10。**multi 回退**：qwen3.6-plus 2/30，qwen-plus 0/20，finish 1/50。原因是并行 read 子任务 3 步耗尽后失败，卡住 locate+apply。不要把 v2/v3 的 multi 数字当成后续提交的结果。
+- **v4（`57491e9`）关键词 planner**：默认 `"Fix the bug..."` 提示在 10 个原任务上 **50/50 次回退到单代理**（true-multi 0/30+0/20）；三个 twofix 任务同样 9/9 回退。只有提示含 `"implement"` 时才会 true-multi（twofix 9/9 通过，但约 2× steps / 2.5× tokens，且两个 worker 是固定的「实现功能 / 加测试」模板，不是按 bug 拆分）。详见 [docs/eval-results.md](docs/eval-results.md) 的 v4 节。
+- **本 PR**：用仓库感知的 LLM planner 取代关键词模板（模板仅作无效 JSON 时的最后兜底）。尚未用真实 LLM 重跑评测，不要把 v4 的 fallback 数字当成这个 planner 的结果。
 
 ### 🗺️ 路线图
 
@@ -407,7 +410,7 @@ ruff check src/minicoder tests --fix
 - [x] SSE 实时事件流
 - [x] Monaco 代码查看器（带批准/回滚）
 - [x] 子任务 DAG 可视化（React Flow）
-- [x] 多代理协作（planner 分解 + 并发子代理，SSE/DAG 事件）
+- [x] 多代理协作（仓库感知 LLM 计划 + 按文件划分的并发 worker + 文件锁 + 全量测试校验）
 - [ ] 基于 tree-sitter 的代码索引
 - [ ] SWE-bench Lite 完整评估
 
@@ -485,7 +488,7 @@ MiniCoder features a modern **React + TypeScript** web console with:
   
 - ⚠️ **Trade-offs**:
   - Increased system complexity
-  - Need careful shared state management (via asyncio.Semaphore)
+  - Need careful shared state management (file-level locks so two workers cannot edit the same file at once; independent edits still run in parallel)
 
 #### 3. Context Management: Fixed Window vs Smart Compression
 
@@ -602,7 +605,7 @@ minicoder run "Add input validation" --repo /path/to/repo
 # Use Docker sandbox
 minicoder run "Run dangerous script" --docker
 
-# Multi-agent (planner + concurrent sub-agents)
+# Multi-agent (repo exploration + LLM JSON plan + file-scoped workers)
 minicoder run "Fix this bug" --mode multi --max-parallel 3
 
 # Block edits to test files
@@ -626,7 +629,7 @@ minicoder serve --port 8000
 
 ### 🧪 Evaluation
 
-`benchmarks/toy_repos/` currently has about 10 intentionally failing toy repos (some multi-file). The harness copies each task to a fresh temp dir, runs the agent, **grades against the original tests** (rewriting tests does not count), and writes JSON + Markdown.
+`benchmarks/toy_repos/` currently has 13 intentionally failing toy repos: 10 single-bug tasks plus 3 `twofix_*` repos (two unrelated modules, one bug each; tests must fail before a fix). The harness copies each task to a fresh temp dir, runs the agent, **grades against the original tests** (rewriting tests does not count), and writes JSON + Markdown.
 
 Against any OpenAI-compatible endpoint:
 
@@ -647,7 +650,7 @@ python benchmarks/evaluate.py \
 Flags:
 
 - `--compression {default,off,aggressive}`
-- `--agent-mode {single,multi}` — single loop vs planner + concurrent sub-agents
+- `--agent-mode {single,multi}` — single loop, or multi-agent (explore the repo, then an LLM emits a schema-validated JSON plan; fall back to single-agent when there are fewer than 2 independent edit subtasks or the plan is invalid; keyword templates are last-resort only)
 - `--repeats N` — mean ± stdev across repeats
 - `--protect-tests {block,flag,off}` — default `block` in eval
 - `--request-timeout` / `--max-retries` (or `MINICODER_REQUEST_TIMEOUT` / `MINICODER_MAX_RETRIES`)
@@ -694,6 +697,7 @@ All runs automatically record:
 - Tool call counts
 - Success/failure status
 - Complete event log
+- In multi mode: true-multi vs fallback-to-single, plus per-worker steps/tokens (written to `results.json`; worker results are no longer truncated to 500 characters)
 
 Query metrics:
 
@@ -753,6 +757,8 @@ DashScope numbers from 2026-10-14 on PR #2 (`cc3079d`) are recorded verbatim in 
 
 - **v2 (`cc3079d` + local scheduler patch) single**: qwen3.6-plus 30/30 on each compression preset; qwen-plus default 20/20. **multi**: qwen3.6-plus 22/30, qwen-plus 3/20, finish 0/50.
 - **v3 (`425af4a`)**: deadlock gone; single still 10/10. **multi regressed** to qwen3.6-plus 2/30, qwen-plus 0/20, finish 1/50, because parallel read subtasks exhausted a 3-step budget and blocked locate+apply. Do not treat v2/v3 multi rows as results for later commits.
+- **v4 (`57491e9`) keyword planner**: the default `"Fix the bug..."` prompt fell back to single-agent on **50/50** original-task runs (0 true-multi). The three twofix tasks also fell back 9/9. True multi only ran when the prompt contained `"implement"` (twofix 9/9 pass, ~2× steps / ~2.5× tokens, with fixed workers "Implement the feature" + "Add tests for the feature"). See the v4 section in [docs/eval-results.md](docs/eval-results.md).
+- **This PR** replaces the keyword planner with a repo-aware LLM planner (templates only as last-resort fallback). No new real-LLM numbers are claimed here; re-run `benchmarks/evaluate.py` separately.
 
 ### 🗺️ Roadmap
 
@@ -767,7 +773,7 @@ DashScope numbers from 2026-10-14 on PR #2 (`cc3079d`) are recorded verbatim in 
 - [x] SSE real-time event streaming
 - [x] Monaco code diff viewer (with approve/rollback)
 - [x] Subtask DAG visualization (React Flow)
-- [x] Multi-agent collaboration (planner + concurrent sub-agents, SSE/DAG events)
+- [x] Multi-agent collaboration (repo-aware LLM plan, file-scoped workers, file locks, full-suite verify)
 - [ ] Tree-sitter based code indexing
 - [ ] Full SWE-bench Lite evaluation
 

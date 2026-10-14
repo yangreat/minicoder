@@ -5,6 +5,8 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import subprocess
+import sys
 from pathlib import Path
 from typing import Any
 from uuid import uuid4
@@ -13,7 +15,18 @@ from openai import AsyncOpenAI
 
 from minicoder.checkpoint import CheckpointManager
 from minicoder.context import ContextManager
+from minicoder.explore import ExplorationNotes, RepoExplorer
+from minicoder.filelock import FileLockManager
 from minicoder.llm import create_with_retry, default_backoff, default_max_retries, default_timeout
+from minicoder.planner import (
+    EMIT_PLAN_TOOL,
+    InvalidPlanError,
+    keyword_fallback_steps,
+    parse_plan_from_tool_arguments,
+    parse_plan_text,
+    plan_to_steps,
+    planner_user_prompt,
+)
 from minicoder.scheduler import Planner, Task, TaskScheduler, TaskStatus
 from minicoder.state import AgentState, EventType, StateManager
 from minicoder.tools import get_all_tools
@@ -117,9 +130,17 @@ class CodingAgent:
         self._step_totals = StepTotals()
         self._step_counter = StepCounter(max_steps, totals=self._step_totals)
         self._workspace_lock = asyncio.Lock()
+        self._file_locks = FileLockManager()
         self._is_subagent = False
         self.agent_id = "main"
         self._fell_back_to_single = False
+        self._true_multi = False
+        self._plan_source = "keyword"
+        self._plan_error: str | None = None
+        self._exploration: ExplorationNotes | None = None
+        self._worker_stats: list[dict[str, Any]] = []
+        self._tokens_used = 0
+        self._allowed_files: list[str] | None = None
 
     def _require_run_id(self) -> str:
         if not self.run_id:
@@ -131,6 +152,11 @@ class CodingAgent:
         self.run_id = run_id or str(uuid4())
         self.current_step = 0
         self._fell_back_to_single = False
+        self._true_multi = False
+        self._plan_source = "keyword"
+        self._plan_error = None
+        self._worker_stats = []
+        self._tokens_used = 0
         self._step_totals = StepTotals()
         self._step_counter = StepCounter(self.max_steps, totals=self._step_totals)
         rid = self._require_run_id()
@@ -159,19 +185,22 @@ class CodingAgent:
         if self.mode == "multi" and not Planner.should_fallback_to_single(
             self._plan_tasks
         ):
+            self._true_multi = True
             result = await self._run_multi(task)
         else:
             if self.mode == "multi":
                 self._fell_back_to_single = True
+                self._true_multi = False
+                reason = self._plan_error or (
+                    "Plan has fewer than 2 independent edit subtasks "
+                    "(or is a pure chain); falling back to single-agent mode."
+                )
                 await self.state_manager.add_event(
                     rid,
                     EventType.MESSAGE_ADDED,
                     {
                         "role": "system",
-                        "content": (
-                            "Plan has fewer than 2 independent edit subtasks "
-                            "(or is a pure chain); falling back to single-agent mode."
-                        ),
+                        "content": reason,
                         "agent_id": "parent",
                     },
                 )
@@ -182,6 +211,11 @@ class CodingAgent:
             "status": result["status"],
             "steps": self.current_step,
             "message": result.get("message", ""),
+            "fell_back_to_single": self._fell_back_to_single,
+            "true_multi": self._true_multi,
+            "plan_source": self._plan_source,
+            "worker_stats": list(self._worker_stats),
+            "file_conflicts": list(self._file_locks.conflicts),
         }
 
     async def resume(self, run_id: str) -> dict[str, Any]:
@@ -234,7 +268,12 @@ class CodingAgent:
         rid = self._require_run_id()
         on_status = self._on_scheduler_status if self.mode == "multi" else None
         scheduler = TaskScheduler(max_parallel=self.max_parallel, on_status=on_status)
-        steps = Planner.decompose_coding_task(task)
+        if self.mode == "multi":
+            steps, source = await self._build_multi_plan(task)
+            self._plan_source = source
+        else:
+            steps = Planner.decompose_coding_task(task)
+            self._plan_source = "keyword"
         retries = 1 if self.mode == "multi" else 0
         task_ids = Planner.create_task_graph(steps, scheduler, max_retries=retries)
         self._scheduler = scheduler
@@ -258,11 +297,103 @@ class CodingAgent:
                         "priority": planned.priority,
                         "dependencies": list(planned.dependencies),
                         "agent_id": planned.agent_id,
+                        "kind": planned.kind,
+                        "files": list(planned.files),
+                        "failing_tests": list(planned.failing_tests),
                     }
                 },
             )
             if self.step_delay:
                 await asyncio.sleep(self.step_delay / 2)
+
+    async def _build_multi_plan(self, task: str) -> tuple[list[dict[str, Any]], str]:
+        """Explore the repo, ask the LLM for a JSON plan, keyword-fallback last."""
+        rid = self._require_run_id()
+        explorer = RepoExplorer()
+        self._exploration = explorer.explore(self.repo_path)
+        await self.state_manager.add_event(
+            rid,
+            EventType.MESSAGE_ADDED,
+            {
+                "role": "system",
+                "content": "Exploration notes:\n" + self._exploration.summary,
+                "agent_id": "planner",
+            },
+        )
+        try:
+            steps = await self._llm_plan_steps(task, self._exploration.summary)
+            n_edits = sum(1 for s in steps if (s.get("kind") or "edit") == "edit")
+            await self.state_manager.add_event(
+                rid,
+                EventType.MESSAGE_ADDED,
+                {
+                    "role": "system",
+                    "content": (
+                        f"LLM planner produced {len(steps)} subtasks "
+                        f"({n_edits} edit)."
+                    ),
+                    "agent_id": "planner",
+                },
+            )
+            return steps, "llm"
+        except Exception as exc:
+            self._plan_error = f"LLM plan invalid ({exc}); using keyword planner fallback."
+            await self.state_manager.add_event(
+                rid,
+                EventType.MESSAGE_ADDED,
+                {
+                    "role": "system",
+                    "content": self._plan_error,
+                    "agent_id": "planner",
+                },
+            )
+            return keyword_fallback_steps(task), "keyword"
+
+    async def _llm_plan_steps(self, task: str, exploration_summary: str) -> list[dict[str, Any]]:
+        """One LLM call; response must be schema-valid plan JSON or emit_plan."""
+        step = await self._step_counter.consume()
+        if step is None:
+            raise InvalidPlanError("step budget exhausted before planning")
+        self.current_step = step
+        await self.state_manager.increment_steps(self._require_run_id())
+
+        messages = [
+            {
+                "role": "system",
+                "content": "You are MiniCoder's planner. Output only a structured plan.",
+            },
+            {
+                "role": "user",
+                "content": planner_user_prompt(task, exploration_summary),
+            },
+        ]
+        response = await create_with_retry(
+            self.client,
+            timeout=self.request_timeout,
+            max_retries=self.max_retries,
+            backoff=self.retry_backoff,
+            model=self.model,
+            messages=messages,
+            tools=[EMIT_PLAN_TOOL],
+            tool_choice="auto",
+        )
+        if getattr(response, "usage", None):
+            tokens = int(response.usage.total_tokens or 0)
+            self._tokens_used += tokens
+            await self.state_manager.add_token_usage(self._require_run_id(), tokens)
+
+        if not getattr(response, "choices", None):
+            raise InvalidPlanError("planner LLM returned no choices")
+        message = response.choices[0].message
+        tool_calls = getattr(message, "tool_calls", None) or []
+        for tool_call in tool_calls:
+            name = getattr(getattr(tool_call, "function", None), "name", "")
+            if name != "emit_plan":
+                continue
+            args = getattr(tool_call.function, "arguments", "") or "{}"
+            return plan_to_steps(parse_plan_from_tool_arguments(args))
+        content = getattr(message, "content", None) or ""
+        return plan_to_steps(parse_plan_text(content))
 
     async def _on_scheduler_status(self, task: Task) -> None:
         rid = self.run_id
@@ -297,14 +428,16 @@ class CodingAgent:
             },
         )
 
-    def _allocate_subtask_budgets(self, n: int) -> list[int]:
+    def _allocate_subtask_budgets(self, n: int, pool: int | None = None) -> list[int]:
         """Split the run step cap by subtask kind: edits get most of the steps."""
         n = max(n, 1)
+        total = pool if pool is not None else self.max_steps
+        total = max(total, n)
         kinds = [t.kind or "edit" for t in self._plan_tasks] or ["edit"] * n
         weights = {"read": 1, "verify": 2, "edit": 5}
         wlist = [weights.get(k, 2) for k in kinds]
         total_w = sum(wlist) or 1
-        budgets = [max(1, (self.max_steps * w) // total_w) for w in wlist]
+        budgets = [max(1, (total * w) // total_w) for w in wlist]
 
         def shrink_order() -> list[int]:
             order: list[int] = []
@@ -312,7 +445,7 @@ class CodingAgent:
                 order.extend(i for i, k in enumerate(kinds) if k == kind)
             return order or list(range(n))
 
-        while sum(budgets) > self.max_steps:
+        while sum(budgets) > total:
             reduced = False
             for i in shrink_order():
                 if budgets[i] > 1:
@@ -321,7 +454,7 @@ class CodingAgent:
                     break
             if not reduced:
                 break
-        remainder = max(0, self.max_steps - sum(budgets))
+        remainder = max(0, total - sum(budgets))
         edit_idx = [i for i, k in enumerate(kinds) if k == "edit"] or list(range(n))
         e = 0
         while remainder > 0:
@@ -355,9 +488,12 @@ class CodingAgent:
         sub._step_totals = self._step_totals
         sub._step_counter = StepCounter(budget, totals=self._step_totals)
         sub._workspace_lock = self._workspace_lock
+        sub._file_locks = self._file_locks
         sub.checkpoint = self.checkpoint
         sub.test_guard = self.test_guard
         sub.tools = self.tools
+        sub._exploration = self._exploration
+        sub._allowed_files = list(task.files) if task.files else None
         return sub
 
     def _collect_partial_notes(self) -> str:
@@ -386,6 +522,115 @@ class CodingAgent:
                 f"### {dep.description}{note}\nstatus={dep.status.value}\n{msg}"
             )
         return "\n\n".join(parts)
+
+    def _read_repo_file(self, rel: str, limit: int = 2500) -> str:
+        path = self.repo_path / rel
+        if not path.exists() or not path.is_file():
+            return f"(file not found: {rel})"
+        try:
+            text = path.read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError) as exc:
+            return f"(unreadable {rel}: {exc})"
+        if len(text) > limit:
+            return text[:limit] + "\n... (truncated)"
+        return text
+
+    def _scoped_worker_context(self, planned: Task) -> str:
+        """Files + failing tests for this worker, plus shared exploration notes."""
+        parts: list[str] = []
+        notes = self._exploration
+        if notes is not None:
+            tree = notes.file_tree
+            if len(tree) > 1500:
+                tree = tree[:1500] + "\n... (truncated)"
+            parts.append("## Shared exploration (file tree)\n" + tree)
+            if planned.failing_tests:
+                parts.append(
+                    "## Failing tests for this subtask\n"
+                    + notes.filter_failures(planned.failing_tests)
+                )
+            elif notes.failing_tests:
+                parts.append(
+                    "## Failing tests (full suite excerpt)\n"
+                    + notes.test_output[:2000]
+                )
+        files = list(planned.files)
+        if not files and notes is not None:
+            files = list(notes.related_files.keys())
+        seen: set[str] = set()
+        for rel in files:
+            if rel in seen:
+                continue
+            seen.add(rel)
+            content = None
+            if notes is not None:
+                content = notes.related_files.get(rel)
+            if not content:
+                content = self._read_repo_file(rel)
+            parts.append(f"## File in your scope: {rel}\n{content}")
+        if planned.files:
+            parts.append(
+                "You should only edit these files: " + ", ".join(planned.files)
+            )
+        if planned.failing_tests:
+            parts.append(
+                "Your failing tests: " + ", ".join(planned.failing_tests)
+            )
+        return "\n\n".join(parts)
+
+    def _record_worker_stat(self, planned: Task, sub: CodingAgent) -> None:
+        planned.steps_used = sub.current_step
+        planned.tokens_used = sub._tokens_used
+        result = planned.result if isinstance(planned.result, dict) else {}
+        self._worker_stats.append(
+            {
+                "agent_id": planned.agent_id or planned.id[:8],
+                "description": planned.description,
+                "kind": planned.kind,
+                "status": planned.status.value,
+                "steps": planned.steps_used,
+                "tokens": planned.tokens_used,
+                "files": list(planned.files),
+                "failing_tests": list(planned.failing_tests),
+                "partial": bool(result.get("partial")),
+                "message": str(result.get("message") or planned.error or ""),
+            }
+        )
+
+    def _run_full_suite(self) -> tuple[bool, str, int]:
+        """Coordinator pytest over the whole repo (no LLM).
+
+        Return ``(passed, output, returncode)``. Pytest uses 5 when no tests
+        were collected; the coordinator then skips the repair pass.
+        """
+        try:
+            env = os.environ.copy()
+            env.pop("PYTEST_ADDOPTS", None)
+            env["PYTEST_DISABLE_PLUGIN_AUTOLOAD"] = "1"
+            proc = subprocess.run(
+                [
+                    sys.executable,
+                    "-m",
+                    "pytest",
+                    "-q",
+                    "--tb=short",
+                    "-p",
+                    "no:cacheprovider",
+                ],
+                cwd=self.repo_path,
+                capture_output=True,
+                text=True,
+                timeout=60,
+                env=env,
+            )
+        except Exception as exc:
+            return False, f"pytest failed to start: {exc}", -1
+        text = ((proc.stdout or "") + "\n" + (proc.stderr or "")).strip()
+        return (
+            proc.returncode == 0,
+            text[-4000:] if text else f"exit {proc.returncode}",
+            int(proc.returncode),
+        )
 
     async def _coordinator_finish(self, message: str, *, success: bool) -> dict[str, Any]:
         """Record a parent finish tool call after merging sub-agent results."""
@@ -423,15 +668,22 @@ class CodingAgent:
             return {"status": "failed", "message": "No plan was produced"}
 
         await self.state_manager.update_run_state(rid, AgentState.EXECUTING)
-        budgets = self._allocate_subtask_budgets(len(self._plan_tasks))
+        remaining = max(1, self.max_steps - self._step_totals.value)
+        budgets = self._allocate_subtask_budgets(len(self._plan_tasks), remaining)
         budget_by_id = {
             planned.id: budgets[i] for i, planned in enumerate(self._plan_tasks)
         }
+        spawned: dict[str, CodingAgent] = {}
 
         async def agent_func(_executor: Any, planned: Task) -> dict[str, Any]:
-            extra = self._dependency_context(scheduler, planned)
+            extra = self._scoped_worker_context(planned)
+            dep_ctx = self._dependency_context(scheduler, planned)
+            if dep_ctx:
+                extra = extra + "\n\n## Context from completed dependency subtasks\n" + dep_ctx
             sub = self._spawn_subagent(planned, budget_by_id.get(planned.id, 3))
-            return await sub.run_subtask(task, planned.description, extra)
+            spawned[planned.id] = sub
+            result = await sub.run_subtask(task, planned.description, extra)
+            return result
 
         try:
             await scheduler.run_all(self, agent_func)
@@ -446,10 +698,13 @@ class CodingAgent:
             return await self._coordinator_finish(message, success=False)
 
         self.current_step = self._step_totals.value
-
+        self._worker_stats = []
         parts: list[str] = []
         hard_failed = False
         for planned in self._plan_tasks:
+            sub = spawned.get(planned.id)
+            if sub is not None:
+                self._record_worker_stat(planned, sub)
             if planned.status in (TaskStatus.FAILED, TaskStatus.BLOCKED) and not planned.optional:
                 hard_failed = True
             result = planned.result if isinstance(planned.result, dict) else {}
@@ -460,12 +715,72 @@ class CodingAgent:
             parts.append(f"- [{tag}] {planned.description}: {msg}")
 
         message = "Merged sub-agent results:\n" + "\n".join(parts)
+        if self._file_locks.conflicts:
+            message += "\n\nFile conflicts:\n" + json.dumps(self._file_locks.conflicts)
         await self.state_manager.add_event(
             rid,
             EventType.MESSAGE_ADDED,
             {"role": "assistant", "content": message, "agent_id": "parent"},
         )
-        return await self._coordinator_finish(message, success=not hard_failed)
+        return await self._verify_and_repair(task, message, hard_failed)
+
+    async def _verify_and_repair(
+        self, overall_task: str, merge_message: str, hard_failed: bool
+    ) -> dict[str, Any]:
+        """Run the full suite; if it fails, one single-agent repair pass."""
+        ok, output, code = self._run_full_suite()
+        if ok:
+            message = merge_message + "\n\nFull test suite: PASS\n" + output
+            return await self._coordinator_finish(message, success=True)
+        if code == 5 or "no tests ran" in output.lower():
+            return await self._coordinator_finish(merge_message, success=not hard_failed)
+
+        remaining = max(0, self.max_steps - self._step_totals.value)
+        if remaining <= 0:
+            message = (
+                merge_message
+                + "\n\nFull test suite: FAIL (no steps left for repair)\n"
+                + output
+            )
+            return await self._coordinator_finish(message, success=not hard_failed)
+
+        repair_task = Task(
+            description="Repair remaining test failures after parallel workers",
+            kind="edit",
+            agent_id="repair",
+        )
+        extra = (
+            merge_message
+            + "\n\nThe combined patch did not make the full suite pass. "
+            "Fix remaining failures. Do not revert unrelated worker edits.\n\n"
+            f"Pytest output:\n{output}"
+        )
+        sub = self._spawn_subagent(repair_task, remaining)
+        repair_result = await sub.run_subtask(
+            overall_task,
+            "Fix remaining failing tests so the full suite passes.",
+            extra,
+        )
+        if isinstance(repair_result, dict) and repair_result.get("status") == "failed":
+            repair_task.status = TaskStatus.FAILED
+        else:
+            repair_task.status = TaskStatus.COMPLETED
+        repair_task.result = repair_result
+        self.current_step = self._step_totals.value
+        self._record_worker_stat(repair_task, sub)
+        ok2, output2, _code2 = self._run_full_suite()
+        repair_msg = ""
+        if isinstance(repair_result, dict):
+            repair_msg = str(repair_result.get("message") or "")
+        status_line = "PASS" if ok2 else "FAIL"
+        message = (
+            merge_message
+            + f"\n\nRepair pass ({repair_task.status.value}): {repair_msg}"
+            + f"\n\nFull test suite after repair: {status_line}\n"
+            + output2
+        )
+        success = ok2 or not hard_failed
+        return await self._coordinator_finish(message, success=success)
 
     async def _agent_loop(self) -> dict[str, Any]:
         """Main agent execution loop."""
@@ -594,9 +909,9 @@ class CodingAgent:
                     self.context.add_message("assistant", message.content)
 
                 if response.usage:
-                    await self.state_manager.add_token_usage(
-                        rid, response.usage.total_tokens
-                    )
+                    tokens = int(response.usage.total_tokens or 0)
+                    self._tokens_used += tokens
+                    await self.state_manager.add_token_usage(rid, tokens)
 
             except Exception as e:
                 await self.state_manager.add_event(
@@ -629,10 +944,42 @@ class CodingAgent:
         )
 
     async def _execute_tool(self, tool_call: Any) -> dict[str, Any]:
-        """Execute a tool call."""
+        """Execute a tool call.
+
+        Malformed JSON arguments are returned as a tool error so the model can retry
+        instead of aborting the whole run.
+        """
         rid = self._require_run_id()
-        function_name = tool_call.function.name
-        arguments = json.loads(tool_call.function.arguments)
+        function_name = getattr(getattr(tool_call, "function", None), "name", "") or "unknown"
+        raw_arguments = getattr(getattr(tool_call, "function", None), "arguments", "") or ""
+
+        try:
+            arguments = json.loads(raw_arguments) if raw_arguments else {}
+            if not isinstance(arguments, dict):
+                raise json.JSONDecodeError(
+                    "tool arguments must be a JSON object", raw_arguments, 0
+                )
+        except json.JSONDecodeError as exc:
+            await self.state_manager.add_event(
+                rid,
+                EventType.TOOL_CALLED,
+                {
+                    "tool": function_name,
+                    "arguments": raw_arguments,
+                    "call_id": tool_call.id,
+                    "agent_id": self.agent_id,
+                    "error": "invalid_json",
+                },
+            )
+            return {
+                "name": function_name,
+                "success": False,
+                "output": "",
+                "error": (
+                    "Invalid JSON in tool arguments "
+                    f"({exc}). Please retry the same tool with valid JSON."
+                ),
+            }
 
         await self.state_manager.add_event(
             rid,
@@ -650,11 +997,7 @@ class CodingAgent:
 
         for tool in self.tools:
             if tool.name == function_name:
-                if function_name in MUTATING_TOOLS:
-                    async with self._workspace_lock:
-                        result = await tool.execute(**arguments)
-                else:
-                    result = await tool.execute(**arguments)
+                result = await self._run_tool(function_name, tool, arguments)
                 return {
                     "name": function_name,
                     "success": result.success,
@@ -667,6 +1010,16 @@ class CodingAgent:
             "success": False,
             "error": f"Unknown tool: {function_name}",
         }
+
+    async def _run_tool(self, function_name: str, tool: Any, arguments: dict[str, Any]) -> Any:
+        path = str(arguments.get("path") or "")
+        if function_name in ("write_file", "apply_patch") and path:
+            async with self._file_locks.hold(path, self.agent_id):
+                return await tool.execute(**arguments)
+        if function_name == "run_shell":
+            async with self._workspace_lock:
+                return await tool.execute(**arguments)
+        return await tool.execute(**arguments)
 
     def _get_tool_schemas(self) -> list[dict[str, Any]]:
         """Get tool schemas for LLM."""

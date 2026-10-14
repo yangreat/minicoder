@@ -35,6 +35,10 @@ class Task:
     agent_id: str | None = None
     kind: str = "edit"
     optional: bool = False
+    files: list[str] = field(default_factory=list)
+    failing_tests: list[str] = field(default_factory=list)
+    steps_used: int = 0
+    tokens_used: int = 0
 
 
 StatusCallback = Callable[[Task], Awaitable[None] | None]
@@ -66,6 +70,8 @@ class TaskScheduler:
         max_retries: int = 3,
         kind: str = "edit",
         optional: bool | None = None,
+        files: list[str] | None = None,
+        failing_tests: list[str] | None = None,
     ) -> str:
         """Add a task to the scheduler."""
         resolved_kind = kind or "edit"
@@ -76,6 +82,8 @@ class TaskScheduler:
             max_retries=max_retries,
             kind=resolved_kind,
             optional=resolved_kind == "read" if optional is None else optional,
+            files=list(files or []),
+            failing_tests=list(failing_tests or []),
         )
         self.tasks[task.id] = task
         return task.id
@@ -387,6 +395,8 @@ class Planner:
 
             kind = str(step.get("kind") or "edit")
             optional = step.get("optional")
+            files = [str(p) for p in (step.get("files") or [])]
+            failing_tests = [str(t) for t in (step.get("failing_tests") or [])]
             task_id = scheduler.add_task(
                 description=step["description"],
                 dependencies=dep_ids,
@@ -394,6 +404,8 @@ class Planner:
                 max_retries=step.get("max_retries", max_retries),
                 kind=kind,
                 optional=bool(optional) if optional is not None else None,
+                files=files,
+                failing_tests=failing_tests,
             )
             task_ids.append(task_id)
 

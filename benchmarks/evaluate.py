@@ -79,6 +79,11 @@ class RunRecord:
     pytest_summary: str
     test_files_flagged: list[str] = field(default_factory=list)
     error: str | None = None
+    fell_back_to_single: bool = False
+    true_multi: bool = False
+    plan_source: str = ""
+    worker_stats: list[dict[str, Any]] = field(default_factory=list)
+    file_conflicts: list[dict[str, Any]] = field(default_factory=list)
 
 
 def list_toy_tasks(toy_dir: Path | None = None) -> list[dict[str, str]]:
@@ -102,12 +107,16 @@ def list_toy_tasks(toy_dir: Path | None = None) -> list[dict[str, str]]:
 def pytest_ok(cwd: Path, timeout: int = 60) -> tuple[bool, str]:
     """Run pytest in ``cwd``. Returns (passed, last-line summary)."""
     try:
+        env = os.environ.copy()
+        env.pop("PYTEST_ADDOPTS", None)
+        env["PYTEST_DISABLE_PLUGIN_AUTOLOAD"] = "1"
         result = subprocess.run(
             [sys.executable, "-m", "pytest", "-q", "-p", "no:cacheprovider"],
             cwd=cwd,
             capture_output=True,
             text=True,
             timeout=timeout,
+            env=env,
         )
     except subprocess.TimeoutExpired:
         return False, "pytest timed out"
@@ -235,6 +244,11 @@ async def run_one(
     msg = ""
     agent: CodingAgent | None = None
     steps = 0
+    fell_back = False
+    true_multi = False
+    plan_source = ""
+    worker_stats: list[dict[str, Any]] = []
+    file_conflicts: list[dict[str, Any]] = []
     t0 = time.time()
     try:
         agent = CodingAgent(
@@ -272,6 +286,20 @@ async def run_one(
         result = await agent.run(DEFAULT_TASK)
         status, msg = result["status"], result.get("message", "")
         steps = agent.current_step
+        fell_back = bool(
+            result.get("fell_back_to_single")
+            or getattr(agent, "_fell_back_to_single", False)
+        )
+        true_multi = bool(result.get("true_multi") or getattr(agent, "_true_multi", False))
+        plan_source = str(result.get("plan_source") or getattr(agent, "_plan_source", "") or "")
+        worker_stats = list(
+            result.get("worker_stats") or getattr(agent, "_worker_stats", []) or []
+        )
+        file_conflicts = list(result.get("file_conflicts") or [])
+        if not file_conflicts:
+            locks = getattr(agent, "_file_locks", None)
+            if locks is not None:
+                file_conflicts = list(locks.conflicts)
     except Exception as exc:
         status, msg = "crash", f"{type(exc).__name__}: {exc}"
         steps = 0
@@ -297,7 +325,7 @@ async def run_one(
         tests_pass=ok,
         tests_restored=True,
         agent_status=status,
-        agent_message=(msg or "")[:500],
+        agent_message=msg or "",
         steps=steps,
         llm_calls=int(usage.get("calls") or 0),
         prompt_tokens=int(usage.get("prompt") or 0),
@@ -308,6 +336,11 @@ async def run_one(
         pytest_summary=summ,
         test_files_flagged=flagged,
         error=None if status != "crash" else msg,
+        fell_back_to_single=fell_back,
+        true_multi=true_multi,
+        plan_source=plan_source,
+        worker_stats=worker_stats,
+        file_conflicts=file_conflicts,
     )
 
 
@@ -336,11 +369,15 @@ def aggregate(records: list[RunRecord]) -> dict[str, Any]:
         n = len(rows)
         passed = sum(1 for r in rows if r.tests_pass)
         finished = sum(1 for r in rows if r.agent_status == "success")
+        true_multi = sum(1 for r in rows if r.true_multi)
+        fell_back = sum(1 for r in rows if r.fell_back_to_single)
         out[key] = {
             "n": n,
             "tests_pass": f"{passed}/{n}",
             "tests_pass_rate": passed / n if n else 0.0,
             "agent_finish": f"{finished}/{n}",
+            "true_multi": f"{true_multi}/{n}",
+            "fell_back_to_single": f"{fell_back}/{n}",
             "steps": _mean_spread([float(r.steps) for r in rows]),
             "total_tokens": _mean_spread([float(r.total_tokens) for r in rows]),
             "wall_s": _mean_spread([r.wall_s for r in rows]),
@@ -358,14 +395,20 @@ def render_markdown(records: list[RunRecord], summary: dict[str, Any]) -> str:
         "",
         "## Per run",
         "",
-        "| model | config | mode | task | repeat | tests pass | agent | steps | tokens | compress | wall s |",
-        "|---|---|---|---|---|---|---|---|---|---|---|",
+        "| model | config | mode | task | repeat | tests pass | agent | multi | steps | tokens | compress | wall s |",
+        "|---|---|---|---|---|---|---|---|---|---|---|---|",
     ]
     for r in records:
+        if r.true_multi:
+            multi_flag = "true-multi"
+        elif r.fell_back_to_single:
+            multi_flag = "fallback"
+        else:
+            multi_flag = r.agent_mode
         lines.append(
             f"| {r.model} | {r.config} | {r.agent_mode} | {r.task} | {r.repeat} | "
-            f"{'PASS' if r.tests_pass else 'FAIL'} | {r.agent_status} | {r.steps} | "
-            f"{r.total_tokens} | {r.compressions_triggered} | {r.wall_s} |"
+            f"{'PASS' if r.tests_pass else 'FAIL'} | {r.agent_status} | {multi_flag} | "
+            f"{r.steps} | {r.total_tokens} | {r.compressions_triggered} | {r.wall_s} |"
         )
     lines += ["", "## Aggregates (mean ± stdev)", ""]
     for key, agg in summary.items():
@@ -376,6 +419,8 @@ def render_markdown(records: list[RunRecord], summary: dict[str, Any]) -> str:
             f"- **{key}**: tests {agg['tests_pass']} "
             f"(rate {agg['tests_pass_rate']:.2%}), "
             f"agent finish {agg['agent_finish']}, "
+            f"true multi {agg.get('true_multi', 'n/a')}, "
+            f"fallback {agg.get('fell_back_to_single', 'n/a')}, "
             f"steps {steps['mean']} ± {steps['stdev']}, "
             f"tokens {toks['mean']} ± {toks['stdev']}, "
             f"wall_s {wall['mean']} ± {wall['stdev']}"
@@ -413,7 +458,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--agent-mode",
         choices=["single", "multi"],
         default="single",
-        help="Single agent loop or multi-agent (planner + concurrent sub-agents).",
+        help="Single loop, or multi-agent (repo-aware LLM plan + concurrent scoped workers).",
     )
     parser.add_argument("--repeats", type=int, default=1, help="Repeats per task (for mean/spread).")
     parser.add_argument("--max-steps", type=int, default=15, help="Step cap per run (shared in multi).")
@@ -515,6 +560,9 @@ async def async_main(args: argparse.Namespace) -> int:
                         "steps": rec.steps,
                         "total_tokens": rec.total_tokens,
                         "wall_s": rec.wall_s,
+                        "true_multi": rec.true_multi,
+                        "fell_back_to_single": rec.fell_back_to_single,
+                        "plan_source": rec.plan_source,
                     }
                 ),
                 flush=True,

@@ -26,7 +26,7 @@ TOY = Path(__file__).resolve().parent.parent / "benchmarks" / "toy_repos"
 def test_ten_toy_repos_exist() -> None:
     tasks = list_toy_tasks(TOY)
     names = {t["name"] for t in tasks}
-    assert len(names) >= 10
+    assert len(names) >= 13
     for required in (
         "calculator",
         "text_stats",
@@ -38,6 +38,9 @@ def test_ten_toy_repos_exist() -> None:
         "csv_stats",
         "lru_cache",
         "todo_store",
+        "twofix_shop",
+        "twofix_textkit",
+        "twofix_geo",
     ):
         assert required in names
 
@@ -53,6 +56,9 @@ def test_ten_toy_repos_exist() -> None:
     "csv_stats",
     "lru_cache",
     "todo_store",
+    "twofix_shop",
+    "twofix_textkit",
+    "twofix_geo",
 ])
 def test_toy_repo_fails_before_fix(name: str) -> None:
     ok, summary = pytest_ok(TOY / name)
@@ -178,7 +184,37 @@ def test_aggregate_mean_and_spread() -> None:
     assert summary[key]["steps"]["mean"] == 6.0
     assert summary[key]["steps"]["min"] == 4.0
     assert summary[key]["steps"]["max"] == 8.0
+    assert summary[key]["true_multi"] == "0/2"
     md = render_markdown(rows, summary)
     assert "calculator" in md
     assert "mean" in md.lower() or "±" in md
     json.dumps(summary)
+
+
+def test_run_record_keeps_full_agent_message() -> None:
+    rec = RunRecord(
+        config="default",
+        task="twofix_shop",
+        model="m",
+        repeat=1,
+        agent_mode="multi",
+        baseline_tests_pass=False,
+        tests_pass=True,
+        tests_restored=True,
+        agent_status="success",
+        agent_message="x" * 800,
+        steps=10,
+        llm_calls=10,
+        prompt_tokens=1,
+        completion_tokens=1,
+        total_tokens=2,
+        compressions_triggered=0,
+        wall_s=1.0,
+        pytest_summary="ok",
+        true_multi=True,
+        worker_stats=[{"description": "Fix pricing", "steps": 4, "tokens": 100}],
+    )
+    dumped = json.dumps(rec.__dict__)
+    assert "x" * 800 in dumped
+    assert rec.true_multi is True
+    assert rec.worker_stats[0]["steps"] == 4

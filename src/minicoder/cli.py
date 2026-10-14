@@ -38,7 +38,7 @@ def main() -> None:
     "--mode",
     type=click.Choice(["single", "multi"]),
     default="single",
-    help="single agent loop or multi-agent (planner + concurrent sub-agents)",
+    help="single loop, or multi-agent (repo-aware LLM plan + concurrent scoped workers)",
 )
 @click.option("--max-parallel", default=3, type=int, help="Max concurrent sub-agents in multi mode")
 @click.option("--request-timeout", default=None, type=float, help="LLM request timeout in seconds")
