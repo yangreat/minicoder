@@ -72,8 +72,7 @@ graph TB
 
 ### 🖥️ Web 控制台
 
-![MiniCoder Console](docs/images/console-screenshot.svg)
-*注：上图为 UI Mockup，展示控制台界面设计*
+![MiniCoder Console](docs/images/console-screenshot.png)
 
 MiniCoder 提供了一个现代化的 Web 控制台，使用 **React + TypeScript** 构建：
 
@@ -414,8 +413,7 @@ See the Mermaid diagram in the Chinese section above for the complete system arc
 
 ### 🖥️ Web Console
 
-![MiniCoder Console](docs/images/console-screenshot.svg)
-*Note: Screenshot is a UI mockup showing the console interface design*
+![MiniCoder Console](docs/images/console-screenshot.png)
 
 MiniCoder features a modern **React + TypeScript** web console with:
 
