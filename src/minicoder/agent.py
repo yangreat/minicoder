@@ -22,21 +22,38 @@ from minicoder.tools.guard import TestFileGuard
 MUTATING_TOOLS = {"write_file", "apply_patch", "run_shell"}
 
 
-class StepCounter:
-    """Shared step budget for a run (parent + sub-agents)."""
+class StepTotals:
+    """Run-wide LLM-step counter (not a cap)."""
 
-    def __init__(self, max_steps: int):
-        self.max_steps = max_steps
+    def __init__(self) -> None:
         self.value = 0
         self._lock = asyncio.Lock()
 
+    async def add(self) -> int:
+        async with self._lock:
+            self.value += 1
+            return self.value
+
+
+class StepCounter:
+    """Per-agent step budget, optionally recording into a shared total."""
+
+    def __init__(self, max_steps: int, totals: StepTotals | None = None):
+        self.max_steps = max_steps
+        self.value = 0
+        self._lock = asyncio.Lock()
+        self.totals = totals
+
     async def consume(self) -> int | None:
-        """Return the new 1-based step number, or None if the budget is exhausted."""
+        """Return the new 1-based local step number, or None if the budget is exhausted."""
         async with self._lock:
             if self.value >= self.max_steps:
                 return None
             self.value += 1
-            return self.value
+            local = self.value
+        if self.totals is not None:
+            await self.totals.add()
+        return local
 
 
 class CodingAgent:
@@ -97,10 +114,12 @@ class CodingAgent:
         self._plan_tasks: list[Task] = []
         self._plan_cursor = 0
         self._scheduler: TaskScheduler | None = None
-        self._step_counter = StepCounter(max_steps)
+        self._step_totals = StepTotals()
+        self._step_counter = StepCounter(max_steps, totals=self._step_totals)
         self._workspace_lock = asyncio.Lock()
         self._is_subagent = False
         self.agent_id = "main"
+        self._fell_back_to_single = False
 
     def _require_run_id(self) -> str:
         if not self.run_id:
@@ -111,7 +130,9 @@ class CodingAgent:
         """Run the agent on a task."""
         self.run_id = run_id or str(uuid4())
         self.current_step = 0
-        self._step_counter = StepCounter(self.max_steps)
+        self._fell_back_to_single = False
+        self._step_totals = StepTotals()
+        self._step_counter = StepCounter(self.max_steps, totals=self._step_totals)
         rid = self._require_run_id()
 
         existing = await self.state_manager.get_run(rid)
@@ -135,9 +156,23 @@ class CodingAgent:
         self.context.add_message("system", system_prompt)
         self.context.add_message("user", task)
 
-        if self.mode == "multi":
+        if self.mode == "multi" and not Planner.is_pure_chain_tasks(self._plan_tasks):
             result = await self._run_multi(task)
         else:
+            if self.mode == "multi":
+                self._fell_back_to_single = True
+                await self.state_manager.add_event(
+                    rid,
+                    EventType.MESSAGE_ADDED,
+                    {
+                        "role": "system",
+                        "content": (
+                            "Plan is a pure dependency chain with no independent "
+                            "subtasks; falling back to single-agent mode."
+                        ),
+                        "agent_id": "parent",
+                    },
+                )
             result = await self._agent_loop()
 
         return {
@@ -198,7 +233,8 @@ class CodingAgent:
         on_status = self._on_scheduler_status if self.mode == "multi" else None
         scheduler = TaskScheduler(max_parallel=self.max_parallel, on_status=on_status)
         steps = Planner.decompose_coding_task(task)
-        task_ids = Planner.create_task_graph(steps, scheduler)
+        retries = 1 if self.mode == "multi" else 0
+        task_ids = Planner.create_task_graph(steps, scheduler, max_retries=retries)
         self._scheduler = scheduler
         self._plan_tasks = []
         for tid in task_ids:
@@ -259,15 +295,41 @@ class CodingAgent:
             },
         )
 
-    def _spawn_subagent(self, task: Task) -> CodingAgent:
-        """Create a sub-agent with isolated context sharing repo, client, and budget."""
+    def _allocate_subtask_budgets(self, n: int) -> list[int]:
+        """Split the run step cap across subtasks so later workers are not starved.
+
+        Independent (no-dep) tasks get the base share; leftover steps go to
+        tasks that have dependencies (locate/fix/verify).
+        """
+        n = max(n, 1)
+        base = max(1, self.max_steps // n)
+        if self.max_steps >= 3 * n:
+            base = max(3, base)
+        budgets = [base] * n
+        remainder = max(0, self.max_steps - sum(budgets))
+        workers = [
+            i
+            for i, task in enumerate(self._plan_tasks)
+            if task.dependencies
+        ]
+        if not workers:
+            workers = list(range(n))
+        w = 0
+        while remainder > 0:
+            budgets[workers[w % len(workers)]] += 1
+            remainder -= 1
+            w += 1
+        return budgets
+
+    def _spawn_subagent(self, task: Task, budget: int) -> CodingAgent:
+        """Create a sub-agent with isolated context and its own step budget."""
         sub = CodingAgent(
             self.repo_path,
             self.state_manager,
             api_key=self._api_key,
             base_url=self._base_url,
             model=self.model,
-            max_steps=self.max_steps,
+            max_steps=budget,
             use_docker=self._use_docker,
             step_delay=self.step_delay,
             mode="single",
@@ -281,7 +343,8 @@ class CodingAgent:
         sub.run_id = self.run_id
         sub._is_subagent = True
         sub.agent_id = task.agent_id or task.id[:8]
-        sub._step_counter = self._step_counter
+        sub._step_totals = self._step_totals
+        sub._step_counter = StepCounter(budget, totals=self._step_totals)
         sub._workspace_lock = self._workspace_lock
         sub.checkpoint = self.checkpoint
         sub.test_guard = self.test_guard
@@ -302,6 +365,34 @@ class CodingAgent:
             parts.append(f"### {dep.description}\nstatus={dep.status.value}\n{msg}")
         return "\n\n".join(parts)
 
+    async def _coordinator_finish(self, message: str, *, success: bool) -> dict[str, Any]:
+        """Record a parent finish tool call after merging sub-agent results."""
+        rid = self._require_run_id()
+        await self.state_manager.add_event(
+            rid,
+            EventType.TOOL_CALLED,
+            {
+                "tool": "finish",
+                "arguments": {"message": message},
+                "call_id": "coordinator_finish",
+                "agent_id": "parent",
+            },
+        )
+        await self.state_manager.add_event(
+            rid,
+            EventType.TOOL_RESULT,
+            {
+                "tool_call_id": "coordinator_finish",
+                "result": {"name": "finish", "output": message},
+                "agent_id": "parent",
+            },
+        )
+        if success:
+            await self.state_manager.update_run_state(rid, AgentState.DONE)
+            return {"status": "success", "message": message}
+        await self.state_manager.update_run_state(rid, AgentState.FAILED)
+        return {"status": "failed", "message": message}
+
     async def _run_multi(self, task: str) -> dict[str, Any]:
         """Run independent subtasks concurrently via isolated sub-agents."""
         rid = self._require_run_id()
@@ -310,14 +401,18 @@ class CodingAgent:
             return {"status": "failed", "message": "No plan was produced"}
 
         await self.state_manager.update_run_state(rid, AgentState.EXECUTING)
+        budgets = self._allocate_subtask_budgets(len(self._plan_tasks))
+        budget_by_id = {
+            planned.id: budgets[i] for i, planned in enumerate(self._plan_tasks)
+        }
 
         async def agent_func(_executor: Any, planned: Task) -> dict[str, Any]:
             extra = self._dependency_context(scheduler, planned)
-            sub = self._spawn_subagent(planned)
+            sub = self._spawn_subagent(planned, budget_by_id.get(planned.id, 3))
             return await sub.run_subtask(task, planned.description, extra)
 
         await scheduler.run_all(self, agent_func)
-        self.current_step = self._step_counter.value
+        self.current_step = self._step_totals.value
 
         parts: list[str] = []
         any_failed = False
@@ -334,13 +429,7 @@ class CodingAgent:
             EventType.MESSAGE_ADDED,
             {"role": "assistant", "content": message, "agent_id": "parent"},
         )
-
-        if any_failed:
-            await self.state_manager.update_run_state(rid, AgentState.FAILED)
-            return {"status": "failed", "message": message}
-
-        await self.state_manager.update_run_state(rid, AgentState.DONE)
-        return {"status": "success", "message": message}
+        return await self._coordinator_finish(message, success=not any_failed)
 
     async def _agent_loop(self) -> dict[str, Any]:
         """Main agent execution loop."""

@@ -90,6 +90,33 @@ class TaskScheduler:
 
         return sorted(ready, key=lambda t: -t.priority)
 
+    def _dependency_unsatisfiable(self, task: Task) -> bool:
+        """True if any dependency has FAILED or BLOCKED (transitively via BLOCKED)."""
+        return any(
+            dep in self.tasks
+            and self.tasks[dep].status in (TaskStatus.FAILED, TaskStatus.BLOCKED)
+            for dep in task.dependencies
+        )
+
+    async def _block_unsatisfiable(self) -> int:
+        """Mark pending tasks with failed/blocked deps as BLOCKED.
+
+        Repeats until a fixed point so a chain A→B→C is fully marked when A
+        fails (B blocked, then C blocked) instead of spinning forever.
+        """
+        marked = 0
+        progressed = True
+        while progressed:
+            progressed = False
+            pending = [t for t in self.tasks.values() if t.status == TaskStatus.PENDING]
+            for task in pending:
+                if self._dependency_unsatisfiable(task):
+                    await self._set_status(task, TaskStatus.BLOCKED)
+                    task.error = "Dependency failed or blocked"
+                    marked += 1
+                    progressed = True
+        return marked
+
     async def execute_task(
         self, task_id: str, executor: Any, agent_func: Any
     ) -> Any | None:
@@ -104,8 +131,13 @@ class TaskScheduler:
                     if isinstance(result, dict) and result.get("status") == "failed":
                         task.result = result
                         task.error = str(result.get("message", "failed"))
-                        await self._set_status(task, TaskStatus.FAILED)
-                        return result
+                        if task.retries >= task.max_retries:
+                            await self._set_status(task, TaskStatus.FAILED)
+                            return result
+                        task.retries += 1
+                        await self._set_status(task, TaskStatus.PENDING)
+                        await asyncio.sleep(min(2**task.retries, 2))
+                        continue
                     await self._set_status(task, TaskStatus.COMPLETED)
                     task.result = result
                     return result
@@ -142,19 +174,18 @@ class TaskScheduler:
                 if not pending:
                     break
 
-                blocked = [
-                    t
-                    for t in pending
-                    if any(
-                        dep in self.tasks and self.tasks[dep].status == TaskStatus.FAILED
-                        for dep in t.dependencies
-                    )
+                # Treat BLOCKED like FAILED so A→B→C does not hang: if A
+                # fails, B is blocked, and C (waiting on B) must be blocked too.
+                marked = await self._block_unsatisfiable()
+                pending_after = [
+                    t for t in self.tasks.values() if t.status == TaskStatus.PENDING
                 ]
-                for task in blocked:
-                    await self._set_status(task, TaskStatus.BLOCKED)
-                    task.error = "Dependency failed"
-
-                if len(blocked) == len(pending):
+                if not pending_after:
+                    break
+                if marked == 0:
+                    for task in pending_after:
+                        await self._set_status(task, TaskStatus.BLOCKED)
+                        task.error = "Unsatisfiable dependencies"
                     break
 
                 await asyncio.sleep(0.05)
@@ -195,19 +226,20 @@ class Planner:
         text = task_description.lower()
 
         if "fix" in text or "bug" in text:
+            # Parallel reads, then one locate+fix worker (not a 5-step chain
+            # that starves "Apply the fix" after "Locate" burns the budget).
             return [
                 {"description": "Read README and project context", "priority": 3},
                 {"description": "Read failing tests", "priority": 3},
                 {
-                    "description": "Locate the buggy code",
-                    "priority": 2,
+                    "description": "Locate the buggy code and apply the fix",
+                    "priority": 1,
                     "depends_on": [0, 1],
                 },
-                {"description": "Apply the fix", "priority": 1, "depends_on": [2]},
                 {
                     "description": "Verify the fix by running tests",
                     "priority": 0,
-                    "depends_on": [3],
+                    "depends_on": [2],
                 },
             ]
         if "implement" in text or "add " in text:
@@ -239,6 +271,40 @@ class Planner:
             },
             {"description": "Verify completion", "priority": 0, "depends_on": [2]},
         ]
+
+    @staticmethod
+    def is_pure_chain(steps: list[dict[str, Any]]) -> bool:
+        """True if every step depends only on the previous one (no parallelism)."""
+        if len(steps) < 2:
+            return False
+        for i, step in enumerate(steps):
+            deps = list(step.get("depends_on") or [])
+            if i == 0:
+                if deps:
+                    return False
+            elif deps != [i - 1]:
+                return False
+        return True
+
+    @staticmethod
+    def is_pure_chain_tasks(tasks: list[Task]) -> bool:
+        """True if the task graph is a single linear chain (one root, no branches)."""
+        if len(tasks) < 2:
+            return False
+        by_id = {t.id: t for t in tasks}
+        roots = [t for t in tasks if not t.dependencies]
+        if len(roots) != 1:
+            return False
+        child_count: dict[str, int] = {t.id: 0 for t in tasks}
+        for task in tasks:
+            if task.dependencies:
+                if len(task.dependencies) != 1:
+                    return False
+                for dep in task.dependencies:
+                    if dep not in by_id:
+                        return False
+                    child_count[dep] = child_count.get(dep, 0) + 1
+        return all(count <= 1 for count in child_count.values())
 
     @staticmethod
     def create_task_graph(

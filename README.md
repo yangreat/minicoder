@@ -389,7 +389,10 @@ ruff check src/minicoder tests --fix
 
 ### 📊 评估结果
 
-真实 LLM 数字需要在合并后用上面的评测命令单独跑，**本仓库不预填通过率或 token 数字**。跑完后看 `benchmarks/results/results.md`。
+2026-10-14 在 DashScope 上对 PR #2 分支（`cc3079d`）做了实测，**完整表格、命令和注释见 [docs/eval-results.md](docs/eval-results.md)**（原文照录，未改数字）。
+
+- **single**：qwen3.6-plus 三档压缩各 30/30，qwen-plus default 20/20，测试通过率 100%。
+- **multi**：当时还没有本次的分步预算 / 链式回退 / coordinator `finish`；调度器死锁是在本地打了 `local_fix.patch` 之后才跑完的。qwen3.6-plus 22/30，qwen-plus 3/20，且 **0/50 次调用 finish**。不要把这些 multi 数字当成当前代码的结果。
 
 ### 🗺️ 路线图
 
@@ -746,7 +749,10 @@ ruff check src/minicoder tests --fix
 
 ### 📊 Evaluation Results
 
-Real-LLM numbers should be produced with the command above after merge. **This repo does not invent pass rates or token counts.** See `benchmarks/results/results.md` after a run.
+DashScope numbers from 2026-10-14 on PR #2 (`cc3079d`) are recorded verbatim in [docs/eval-results.md](docs/eval-results.md). No new figures are invented here.
+
+- **single**: qwen3.6-plus 30/30 on each compression preset; qwen-plus default 20/20 (100% tests pass).
+- **multi**: measured *before* the per-subtask budgets / chain fallback / coordinator `finish` in this follow-up, and *after* a local scheduler hang fix (`local_fix.patch`). qwen3.6-plus 22/30, qwen-plus 3/20, and **finish was never called (0/50)**. Do not treat those multi rows as results for the current code.
 
 ### 🗺️ Roadmap
 
