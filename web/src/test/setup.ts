@@ -1,6 +1,6 @@
 import '@testing-library/jest-dom';
 
-(globalThis as any).ResizeObserver = class ResizeObserver {
+(globalThis as {ResizeObserver?: typeof ResizeObserver}).ResizeObserver = class ResizeObserver {
   observe() {}
   unobserve() {}
   disconnect() {}
