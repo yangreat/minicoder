@@ -1,10 +1,9 @@
 """Core coding agent with LLM integration."""
 
-import asyncio
 import json
 import os
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any
 from uuid import uuid4
 
 from openai import AsyncOpenAI
@@ -22,8 +21,8 @@ class CodingAgent:
         self,
         repo_path: Path,
         state_manager: StateManager,
-        api_key: Optional[str] = None,
-        base_url: Optional[str] = None,
+        api_key: str | None = None,
+        base_url: str | None = None,
         model: str = "gpt-4",
         max_steps: int = 30,
         use_docker: bool = False,
@@ -42,10 +41,10 @@ class CodingAgent:
         self.checkpoint = CheckpointManager(self.repo_path)
         self.tools = get_all_tools(self.repo_path, use_docker=use_docker)
 
-        self.run_id: Optional[str] = None
+        self.run_id: str | None = None
         self.current_step = 0
 
-    async def run(self, task: str, run_id: Optional[str] = None) -> Dict[str, Any]:
+    async def run(self, task: str, run_id: str | None = None) -> dict[str, Any]:
         """Run the agent on a task."""
         self.run_id = run_id or str(uuid4())
         self.current_step = 0
@@ -67,7 +66,7 @@ class CodingAgent:
             "message": result.get("message", ""),
         }
 
-    async def resume(self, run_id: str) -> Dict[str, Any]:
+    async def resume(self, run_id: str) -> dict[str, Any]:
         """Resume a previous run."""
         run = await self.state_manager.get_run(run_id)
         if not run:
@@ -88,7 +87,7 @@ class CodingAgent:
             "message": result.get("message", ""),
         }
 
-    async def _agent_loop(self) -> Dict[str, Any]:
+    async def _agent_loop(self) -> dict[str, Any]:
         """Main agent execution loop."""
         while self.current_step < self.max_steps:
             try:
@@ -181,7 +180,7 @@ class CodingAgent:
 
         return response
 
-    async def _execute_tool(self, tool_call: Any) -> Dict[str, Any]:
+    async def _execute_tool(self, tool_call: Any) -> dict[str, Any]:
         """Execute a tool call."""
         function_name = tool_call.function.name
         arguments = json.loads(tool_call.function.arguments)
@@ -207,7 +206,7 @@ class CodingAgent:
 
         return {"name": function_name, "success": False, "error": f"Unknown tool: {function_name}"}
 
-    def _get_tool_schemas(self) -> List[Dict[str, Any]]:
+    def _get_tool_schemas(self) -> list[dict[str, Any]]:
         """Get tool schemas for LLM."""
         schemas = []
 
@@ -245,7 +244,7 @@ class CodingAgent:
 
         return schemas
 
-    async def _restore_context_from_events(self, events: List[Any]) -> None:
+    async def _restore_context_from_events(self, events: list[Any]) -> None:
         """Restore context from event history."""
         for event in events:
             if event.event_type == EventType.MESSAGE_ADDED:

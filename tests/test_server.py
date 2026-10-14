@@ -1,13 +1,12 @@
 """Tests for FastAPI server."""
 
-import json
-import pytest
 from pathlib import Path
+
+import pytest
 from fastapi.testclient import TestClient
 
 from minicoder.server import app
 from minicoder.state import StateManager
-
 
 client = TestClient(app)
 

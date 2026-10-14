@@ -3,7 +3,7 @@
 import hashlib
 import json
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any
 
 try:
     import tiktoken
@@ -47,14 +47,14 @@ class ContextManager:
         self.max_tokens = max_tokens
         self.keep_recent = keep_recent
         self.token_counter = TokenCounter(model)
-        self.messages: List[Dict[str, Any]] = []
-        self.offloaded_outputs: Dict[str, str] = {}
+        self.messages: list[dict[str, Any]] = []
+        self.offloaded_outputs: dict[str, str] = {}
         self._output_dir = repo_path / ".minicoder" / "outputs"
         self._output_dir.mkdir(parents=True, exist_ok=True)
 
-    def add_message(self, role: str, content: str, tool_calls: Optional[List[Dict]] = None) -> None:
+    def add_message(self, role: str, content: str, tool_calls: list[dict] | None = None) -> None:
         """Add a message to context."""
-        message: Dict[str, Any] = {"role": role, "content": content}
+        message: dict[str, Any] = {"role": role, "content": content}
         if tool_calls:
             message["tool_calls"] = tool_calls
         self.messages.append(message)
@@ -77,7 +77,7 @@ class ContextManager:
         self.offloaded_outputs[tool_call_id] = str(file_path)
         return file_path.relative_to(self.repo_path)
 
-    def get_messages(self, include_system: bool = True) -> List[Dict[str, Any]]:
+    def get_messages(self, include_system: bool = True) -> list[dict[str, Any]]:
         """Get messages within token budget."""
         if not self.messages:
             return []
@@ -100,14 +100,14 @@ class ContextManager:
         else:
             return recent_messages
 
-    def _message_text(self, message: Dict[str, Any]) -> str:
+    def _message_text(self, message: dict[str, Any]) -> str:
         """Extract text from a message for token counting."""
         parts = [message.get("content", "")]
         if "tool_calls" in message:
             parts.extend(json.dumps(tc) for tc in message["tool_calls"])
         return " ".join(filter(None, parts))
 
-    def _summarize_messages(self, messages: List[Dict[str, Any]]) -> str:
+    def _summarize_messages(self, messages: list[dict[str, Any]]) -> str:
         """Create a summary of messages."""
         summary_parts = []
 
@@ -125,7 +125,7 @@ class ContextManager:
 
         return "\n".join(summary_parts[:20])
 
-    def load_project_memory(self) -> Optional[str]:
+    def load_project_memory(self) -> str | None:
         """Load project memory file if it exists."""
         memory_files = ["AGENTS.md", ".agents.md", "MEMORY.md"]
 
@@ -151,7 +151,7 @@ class ContextManager:
 
         return "\n\n".join(parts)
 
-    def estimate_usage(self) -> Dict[str, int]:
+    def estimate_usage(self) -> dict[str, int]:
         """Estimate current token usage."""
         total = sum(self.token_counter.count(self._message_text(m)) for m in self.messages)
         system = self.token_counter.count(self.get_system_prompt())

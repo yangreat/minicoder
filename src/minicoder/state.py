@@ -1,12 +1,10 @@
 """State management with event sourcing and SQLite persistence."""
 
-import asyncio
 import json
 import time
-from datetime import datetime
 from enum import Enum
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any
 from uuid import uuid4
 
 import aiosqlite
@@ -42,7 +40,7 @@ class Event(BaseModel):
     run_id: str
     timestamp: float = Field(default_factory=time.time)
     event_type: EventType
-    data: Dict[str, Any]
+    data: dict[str, Any]
 
 
 class RunMetadata(BaseModel):
@@ -63,7 +61,7 @@ class StateManager:
 
     def __init__(self, db_path: Path):
         self.db_path = db_path
-        self._conn: Optional[aiosqlite.Connection] = None
+        self._conn: aiosqlite.Connection | None = None
 
     async def initialize(self) -> None:
         """Initialize database schema."""
@@ -138,7 +136,7 @@ class StateManager:
 
         return metadata
 
-    async def get_run(self, run_id: str) -> Optional[RunMetadata]:
+    async def get_run(self, run_id: str) -> RunMetadata | None:
         """Get run metadata."""
         async with self._conn.execute(  # type: ignore
             "SELECT * FROM runs WHERE run_id = ?", (run_id,)
@@ -158,7 +156,7 @@ class StateManager:
                 token_usage=row[7],
             )
 
-    async def list_runs(self, limit: int = 50) -> List[RunMetadata]:
+    async def list_runs(self, limit: int = 50) -> list[RunMetadata]:
         """List all runs."""
         async with self._conn.execute(  # type: ignore
             "SELECT * FROM runs ORDER BY created_at DESC LIMIT ?", (limit,)
@@ -204,7 +202,7 @@ class StateManager:
         )
         await self._conn.commit()  # type: ignore
 
-    async def add_event(self, run_id: str, event_type: EventType, data: Dict[str, Any]) -> Event:
+    async def add_event(self, run_id: str, event_type: EventType, data: dict[str, Any]) -> Event:
         """Add an event to the history."""
         event = Event(run_id=run_id, event_type=event_type, data=data)
 
@@ -219,7 +217,7 @@ class StateManager:
 
         return event
 
-    async def get_events(self, run_id: str, limit: Optional[int] = None) -> List[Event]:
+    async def get_events(self, run_id: str, limit: int | None = None) -> list[Event]:
         """Get events for a run."""
         query = "SELECT * FROM events WHERE run_id = ? ORDER BY timestamp ASC"
         params: tuple = (run_id,)

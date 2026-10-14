@@ -3,7 +3,7 @@
 import asyncio
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Any, Dict, List, Optional, Set
+from typing import Any
 from uuid import uuid4
 
 
@@ -24,10 +24,10 @@ class Task:
     id: str = field(default_factory=lambda: str(uuid4()))
     description: str = ""
     status: TaskStatus = TaskStatus.PENDING
-    dependencies: Set[str] = field(default_factory=set)
+    dependencies: set[str] = field(default_factory=set)
     priority: int = 0
-    result: Optional[Any] = None
-    error: Optional[str] = None
+    result: Any | None = None
+    error: str | None = None
     retries: int = 0
     max_retries: int = 3
 
@@ -37,13 +37,13 @@ class TaskScheduler:
 
     def __init__(self, max_parallel: int = 3):
         self.max_parallel = max_parallel
-        self.tasks: Dict[str, Task] = {}
+        self.tasks: dict[str, Task] = {}
         self._semaphore = asyncio.Semaphore(max_parallel)
 
     def add_task(
         self,
         description: str,
-        dependencies: Optional[List[str]] = None,
+        dependencies: list[str] | None = None,
         priority: int = 0,
         max_retries: int = 3,
     ) -> str:
@@ -57,7 +57,7 @@ class TaskScheduler:
         self.tasks[task.id] = task
         return task.id
 
-    def get_ready_tasks(self) -> List[Task]:
+    def get_ready_tasks(self) -> list[Task]:
         """Get tasks that are ready to run."""
         ready = []
 
@@ -76,7 +76,7 @@ class TaskScheduler:
 
     async def execute_task(
         self, task_id: str, executor: Any, agent_func: Any
-    ) -> Optional[Any]:
+    ) -> Any | None:
         """Execute a single task."""
         task = self.tasks[task_id]
 
@@ -100,7 +100,7 @@ class TaskScheduler:
 
         return None
 
-    async def run_all(self, executor: Any, agent_func: Any) -> Dict[str, Any]:
+    async def run_all(self, executor: Any, agent_func: Any) -> dict[str, Any]:
         """Run all tasks, respecting dependencies."""
         results = {}
 
@@ -142,14 +142,14 @@ class TaskScheduler:
 
         return results
 
-    def get_status_summary(self) -> Dict[str, int]:
+    def get_status_summary(self) -> dict[str, int]:
         """Get summary of task statuses."""
         summary = {status.value: 0 for status in TaskStatus}
         for task in self.tasks.values():
             summary[task.status.value] += 1
         return summary
 
-    def get_task(self, task_id: str) -> Optional[Task]:
+    def get_task(self, task_id: str) -> Task | None:
         """Get a task by ID."""
         return self.tasks.get(task_id)
 
@@ -158,7 +158,7 @@ class Planner:
     """Decompose high-level tasks into subtasks."""
 
     @staticmethod
-    def decompose_coding_task(task_description: str) -> List[Dict[str, Any]]:
+    def decompose_coding_task(task_description: str) -> list[dict[str, Any]]:
         """Decompose a coding task into steps."""
         steps = []
 
@@ -186,7 +186,7 @@ class Planner:
         return steps
 
     @staticmethod
-    def create_task_graph(steps: List[Dict[str, Any]], scheduler: TaskScheduler) -> List[str]:
+    def create_task_graph(steps: list[dict[str, Any]], scheduler: TaskScheduler) -> list[str]:
         """Create a task graph from decomposed steps."""
         task_ids = []
 

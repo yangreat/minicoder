@@ -1,9 +1,9 @@
 """Test agent with mock LLM."""
 
 import json
-import pytest
 from pathlib import Path
-from unittest.mock import AsyncMock, patch
+
+import pytest
 
 from minicoder.agent import CodingAgent
 from minicoder.state import StateManager
@@ -49,7 +49,7 @@ async def test_agent_simple_task(tmp_path: Path) -> None:
         print(f"Result: {result}")
         if result["status"] != "success":
             print(f"Error message: {result.get('message', 'No message')}")
-        
+
         assert result["status"] == "success", f"Expected success but got {result['status']}: {result.get('message', '')}"
         assert (tmp_path / "hello.txt").exists()
         assert (tmp_path / "hello.txt").read_text() == "Hello, World!"

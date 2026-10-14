@@ -16,7 +16,7 @@ class ToolResult(BaseModel):
 
     success: bool
     output: str
-    error: Optional[str] = None
+    error: str | None = None
 
 
 class ReadFileTool:
@@ -135,7 +135,7 @@ class ApplyPatchTool:
     def _apply_unified_diff(self, original: str, patch: str) -> ToolResult:
         """Apply unified diff patch."""
         try:
-            original_lines = original.splitlines(keepends=True)
+            original.splitlines(keepends=True)
             patch_lines = patch.splitlines(keepends=True)
 
             result_lines = list(difflib.restore(patch_lines, 2))
@@ -275,7 +275,7 @@ class SearchCodeTool:
     def __init__(self, repo_path: Path):
         self.repo_path = repo_path
 
-    async def execute(self, pattern: str, file_pattern: Optional[str] = None) -> ToolResult:
+    async def execute(self, pattern: str, file_pattern: str | None = None) -> ToolResult:
         """Execute the tool."""
         try:
             if self._has_ripgrep():
@@ -293,7 +293,7 @@ class SearchCodeTool:
         except (subprocess.CalledProcessError, FileNotFoundError):
             return False
 
-    async def _search_ripgrep(self, pattern: str, file_pattern: Optional[str]) -> ToolResult:
+    async def _search_ripgrep(self, pattern: str, file_pattern: str | None) -> ToolResult:
         """Search using ripgrep."""
         cmd = ["rg", "--line-number", "--no-heading", "--color", "never", pattern]
         if file_pattern:
@@ -316,7 +316,7 @@ class SearchCodeTool:
         else:
             return ToolResult(success=False, output="", error=stderr.decode("utf-8"))
 
-    async def _search_python(self, pattern: str, file_pattern: Optional[str]) -> ToolResult:
+    async def _search_python(self, pattern: str, file_pattern: str | None) -> ToolResult:
         """Fallback search using Python."""
         regex = re.compile(pattern)
         results = []
@@ -371,7 +371,7 @@ class ListFilesTool:
     def __init__(self, repo_path: Path):
         self.repo_path = repo_path
 
-    async def execute(self, path: str = ".", pattern: Optional[str] = None) -> ToolResult:
+    async def execute(self, path: str = ".", pattern: str | None = None) -> ToolResult:
         """Execute the tool."""
         try:
             dir_path = self.repo_path / path
@@ -401,7 +401,7 @@ class ListFilesTool:
             return ToolResult(success=False, output="", error=str(e))
 
 
-def get_all_tools(repo_path: Path, use_docker: bool = False) -> List[Any]:
+def get_all_tools(repo_path: Path, use_docker: bool = False) -> list[Any]:
     """Get all available tools."""
     return [
         ReadFileTool(repo_path),

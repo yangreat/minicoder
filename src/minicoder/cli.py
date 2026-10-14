@@ -3,7 +3,6 @@
 import asyncio
 import os
 from pathlib import Path
-from typing import Optional
 
 import click
 from rich.console import Console
@@ -35,8 +34,8 @@ def run(
     task: str,
     repo: str,
     model: str,
-    base_url: Optional[str],
-    api_key: Optional[str],
+    base_url: str | None,
+    api_key: str | None,
     max_steps: int,
     docker: bool,
 ) -> None:
@@ -48,8 +47,8 @@ async def _run_agent(
     task: str,
     repo: str,
     model: str,
-    base_url: Optional[str],
-    api_key: Optional[str],
+    base_url: str | None,
+    api_key: str | None,
     max_steps: int,
     docker: bool,
 ) -> None:
@@ -57,7 +56,7 @@ async def _run_agent(
     repo_path = Path(repo).resolve()
     db_path = repo_path / ".minicoder" / "state.db"
 
-    console.print(f"[bold blue]Starting MiniCoder[/bold blue]")
+    console.print("[bold blue]Starting MiniCoder[/bold blue]")
     console.print(f"Task: {task}")
     console.print(f"Repo: {repo_path}")
     console.print(f"Model: {model}")
@@ -99,8 +98,8 @@ def resume(
     run_id: str,
     repo: str,
     model: str,
-    base_url: Optional[str],
-    api_key: Optional[str],
+    base_url: str | None,
+    api_key: str | None,
     max_steps: int,
 ) -> None:
     """Resume a previous run."""
@@ -111,8 +110,8 @@ async def _resume_agent(
     run_id: str,
     repo: str,
     model: str,
-    base_url: Optional[str],
-    api_key: Optional[str],
+    base_url: str | None,
+    api_key: str | None,
     max_steps: int,
 ) -> None:
     """Async implementation of resume command."""

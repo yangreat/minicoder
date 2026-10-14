@@ -1,7 +1,8 @@
 """Test state management."""
 
-import pytest
 from pathlib import Path
+
+import pytest
 
 from minicoder.state import AgentState, EventType, StateManager
 

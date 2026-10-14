@@ -1,6 +1,6 @@
 """Mock LLM for testing."""
 
-from typing import Any, Dict, List, Optional
+from typing import Any
 
 
 class MockChoice:
@@ -15,8 +15,8 @@ class MockMessage:
 
     def __init__(
         self,
-        content: Optional[str] = None,
-        tool_calls: Optional[List["MockToolCall"]] = None,
+        content: str | None = None,
+        tool_calls: list["MockToolCall"] | None = None,
     ):
         self.content = content
         self.tool_calls = tool_calls
@@ -30,7 +30,7 @@ class MockToolCall:
         self.type = "function"
         self.function = MockFunction(function_name, arguments)
 
-    def model_dump(self) -> Dict[str, Any]:
+    def model_dump(self) -> dict[str, Any]:
         """Convert to dict."""
         return {
             "id": self.id,
@@ -61,9 +61,9 @@ class MockResponse:
 
     def __init__(
         self,
-        content: Optional[str] = None,
-        tool_calls: Optional[List[MockToolCall]] = None,
-        usage: Optional[MockUsage] = None,
+        content: str | None = None,
+        tool_calls: list[MockToolCall] | None = None,
+        usage: MockUsage | None = None,
     ):
         message = MockMessage(content=content, tool_calls=tool_calls)
         self.choices = [MockChoice(message)]
@@ -73,10 +73,10 @@ class MockResponse:
 class MockLLM:
     """Mock LLM for testing."""
 
-    def __init__(self, responses: Optional[List[MockResponse]] = None):
+    def __init__(self, responses: list[MockResponse] | None = None):
         self.responses = responses or []
         self.call_count = 0
-        self.calls: List[Dict[str, Any]] = []
+        self.calls: list[dict[str, Any]] = []
 
     async def create(self, **kwargs: Any) -> MockResponse:
         """Mock create method."""
@@ -93,12 +93,12 @@ class MockLLM:
 class MockOpenAI:
     """Mock OpenAI client."""
 
-    def __init__(self, responses: Optional[List[MockResponse]] = None):
+    def __init__(self, responses: list[MockResponse] | None = None):
         self.chat = MockChat(responses)
 
 
 class MockChat:
     """Mock chat completions."""
 
-    def __init__(self, responses: Optional[List[MockResponse]] = None):
+    def __init__(self, responses: list[MockResponse] | None = None):
         self.completions = MockLLM(responses)

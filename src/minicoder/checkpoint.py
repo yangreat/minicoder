@@ -1,7 +1,6 @@
 """Git-based checkpoints for workspace state."""
 
 from pathlib import Path
-from typing import List, Optional
 
 from git import Repo
 from git.exc import GitCommandError
@@ -38,7 +37,7 @@ class CheckpointManager:
         except GitCommandError as e:
             raise RuntimeError(f"Failed to create checkpoint: {e}")
 
-    def list_checkpoints(self, run_id: str) -> List[dict]:
+    def list_checkpoints(self, run_id: str) -> list[dict]:
         """List all checkpoints for a run."""
         checkpoints = []
 
@@ -65,7 +64,7 @@ class CheckpointManager:
         except GitCommandError as e:
             raise RuntimeError(f"Failed to rollback: {e}")
 
-    def get_current_sha(self) -> Optional[str]:
+    def get_current_sha(self) -> str | None:
         """Get current commit SHA."""
         try:
             if self.repo.head.is_valid():
@@ -78,7 +77,7 @@ class CheckpointManager:
         """Check if there are uncommitted changes."""
         return self.repo.is_dirty() or len(self.repo.untracked_files) > 0
 
-    def get_diff(self, from_sha: Optional[str] = None, to_sha: Optional[str] = None) -> str:
+    def get_diff(self, from_sha: str | None = None, to_sha: str | None = None) -> str:
         """Get diff between two commits or against working tree."""
         try:
             if from_sha and to_sha:

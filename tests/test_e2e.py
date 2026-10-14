@@ -2,8 +2,8 @@
 
 import asyncio
 import subprocess
+
 import pytest
-from pathlib import Path
 
 # Check if playwright is available
 try:
@@ -23,31 +23,31 @@ async def test_web_console_loads():
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
     )
-    
+
     await asyncio.sleep(5)
-    
+
     try:
         async with async_playwright() as p:
             browser = await p.chromium.launch(headless=True)
             page = await browser.new_page()
-            
+
             # Load the app
             response = await page.goto("http://localhost:8001/")
             assert response.status == 200
-            
+
             # Wait for app to load
             await page.wait_for_selector('.app-header', timeout=10000)
-            
+
             # Verify title
             title = await page.title()
             assert "MiniCoder" in title
-            
+
             # Verify main UI elements exist
             task_input = await page.locator('#task').count()
             assert task_input > 0, "Task input should exist"
-            
+
             await browser.close()
-            
+
     finally:
         backend.terminate()
         try:

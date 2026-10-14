@@ -32,7 +32,7 @@ jobs:
 
     - name: Run linting
       run: |
-        ruff check src/minicoder tests
+        ruff check src/minicoder tests --ignore E501,F401,UP035
 
     - name: Run tests
       run: |

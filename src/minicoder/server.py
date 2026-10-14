@@ -1,22 +1,21 @@
 """FastAPI server for MiniCoder web console."""
 
-import asyncio
 import json
+from collections.abc import AsyncIterator
 from pathlib import Path
-from typing import Any, AsyncIterator, Dict, List, Optional
+from typing import Any
 from uuid import uuid4
 
-from fastapi import FastAPI, HTTPException, BackgroundTasks
+from fastapi import BackgroundTasks, FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse
+from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 from sse_starlette.sse import EventSourceResponse
 
 from minicoder.agent import CodingAgent
 from minicoder.checkpoint import CheckpointManager
-from minicoder.state import AgentState, EventType, RunMetadata, StateManager
-
+from minicoder.state import AgentState, StateManager
 
 app = FastAPI(title="MiniCoder API", version="0.1.0")
 
@@ -35,8 +34,8 @@ class StartRunRequest(BaseModel):
     task: str
     repo_path: str = "."
     model: str = "gpt-4"
-    base_url: Optional[str] = None
-    api_key: Optional[str] = None
+    base_url: str | None = None
+    api_key: str | None = None
     max_steps: int = 30
     use_docker: bool = False
     use_mock: bool = False
@@ -47,8 +46,8 @@ class ResumeRunRequest(BaseModel):
 
     run_id: str
     model: str = "gpt-4"
-    base_url: Optional[str] = None
-    api_key: Optional[str] = None
+    base_url: str | None = None
+    api_key: str | None = None
     max_steps: int = 30
     use_mock: bool = False
 
@@ -79,7 +78,7 @@ class EventResponse(BaseModel):
     run_id: str
     timestamp: float
     event_type: str
-    data: Dict[str, Any]
+    data: dict[str, Any]
 
 
 class CheckpointResponse(BaseModel):
@@ -97,8 +96,8 @@ class DiffResponse(BaseModel):
     diff: str
 
 
-active_agents: Dict[str, CodingAgent] = {}
-state_managers: Dict[str, StateManager] = {}
+active_agents: dict[str, CodingAgent] = {}
+state_managers: dict[str, StateManager] = {}
 
 
 def get_state_manager(repo_path: str) -> StateManager:
@@ -120,8 +119,8 @@ async def ensure_state_manager_initialized(manager: StateManager) -> None:
 
 
 
-@app.get("/api/runs", response_model=List[RunResponse])
-async def list_runs(repo_path: str = ".", limit: int = 50) -> List[RunResponse]:
+@app.get("/api/runs", response_model=list[RunResponse])
+async def list_runs(repo_path: str = ".", limit: int = 50) -> list[RunResponse]:
     """List all runs for a repository."""
     manager = get_state_manager(repo_path)
     await ensure_state_manager_initialized(manager)
@@ -164,8 +163,8 @@ async def get_run(run_id: str, repo_path: str = ".") -> RunResponse:
     )
 
 
-@app.get("/api/runs/{run_id}/events", response_model=List[EventResponse])
-async def get_run_events(run_id: str, repo_path: str = ".", limit: Optional[int] = None) -> List[EventResponse]:
+@app.get("/api/runs/{run_id}/events", response_model=list[EventResponse])
+async def get_run_events(run_id: str, repo_path: str = ".", limit: int | None = None) -> list[EventResponse]:
     """Get events for a specific run."""
     manager = get_state_manager(repo_path)
     await ensure_state_manager_initialized(manager)
@@ -186,9 +185,9 @@ async def get_run_events(run_id: str, repo_path: str = ".", limit: Optional[int]
 async def run_agent_with_stream(
     agent: CodingAgent,
     task: str,
-    run_id: Optional[str] = None,
+    run_id: str | None = None,
     resume: bool = False,
-) -> AsyncIterator[Dict[str, Any]]:
+) -> AsyncIterator[dict[str, Any]]:
     """Run agent and stream events."""
     try:
         if resume:
@@ -208,7 +207,7 @@ async def run_agent_with_stream(
 
 
 @app.post("/api/runs/start")
-async def start_run(request: StartRunRequest, background_tasks: BackgroundTasks) -> Dict[str, str]:
+async def start_run(request: StartRunRequest, background_tasks: BackgroundTasks) -> dict[str, str]:
     """Start a new run."""
     run_id = str(uuid4())
     repo_path = Path(request.repo_path).resolve()
@@ -271,7 +270,7 @@ async def stream_run(run_id: str, repo_path: str = ".") -> EventSourceResponse:
     manager = get_state_manager(repo_path)
     await ensure_state_manager_initialized(manager)
 
-    async def event_generator() -> AsyncIterator[Dict[str, Any]]:
+    async def event_generator() -> AsyncIterator[dict[str, Any]]:
         """Generate SSE events."""
         events = await manager.get_events(run_id)
         for event in events:
@@ -297,7 +296,7 @@ async def stream_run(run_id: str, repo_path: str = ".") -> EventSourceResponse:
 
 
 @app.post("/api/runs/{run_id}/resume")
-async def resume_run(run_id: str, request: ResumeRunRequest, background_tasks: BackgroundTasks) -> Dict[str, str]:
+async def resume_run(run_id: str, request: ResumeRunRequest, background_tasks: BackgroundTasks) -> dict[str, str]:
     """Resume a run."""
     manager = get_state_manager(request.repo_path if hasattr(request, 'repo_path') else ".")
     await ensure_state_manager_initialized(manager)
@@ -355,8 +354,8 @@ async def resume_run(run_id: str, request: ResumeRunRequest, background_tasks: B
     return {"run_id": run_id, "status": "resumed"}
 
 
-@app.get("/api/runs/{run_id}/checkpoints", response_model=List[CheckpointResponse])
-async def list_checkpoints(run_id: str, repo_path: str = ".") -> List[CheckpointResponse]:
+@app.get("/api/runs/{run_id}/checkpoints", response_model=list[CheckpointResponse])
+async def list_checkpoints(run_id: str, repo_path: str = ".") -> list[CheckpointResponse]:
     """List checkpoints for a run."""
     checkpoint_manager = CheckpointManager(Path(repo_path))
     checkpoints = checkpoint_manager.list_checkpoints(run_id)
@@ -373,7 +372,7 @@ async def list_checkpoints(run_id: str, repo_path: str = ".") -> List[Checkpoint
 
 
 @app.post("/api/runs/{run_id}/rollback")
-async def rollback_checkpoint(run_id: str, request: RollbackRequest, repo_path: str = ".") -> Dict[str, str]:
+async def rollback_checkpoint(run_id: str, request: RollbackRequest, repo_path: str = ".") -> dict[str, str]:
     """Rollback to a checkpoint."""
     checkpoint_manager = CheckpointManager(Path(repo_path))
 
@@ -385,7 +384,7 @@ async def rollback_checkpoint(run_id: str, request: RollbackRequest, repo_path: 
 
 
 @app.get("/api/runs/{run_id}/diff", response_model=DiffResponse)
-async def get_run_diff(run_id: str, repo_path: str = ".", from_sha: Optional[str] = None) -> DiffResponse:
+async def get_run_diff(run_id: str, repo_path: str = ".", from_sha: str | None = None) -> DiffResponse:
     """Get diff for a run."""
     checkpoint_manager = CheckpointManager(Path(repo_path))
 
@@ -397,7 +396,7 @@ async def get_run_diff(run_id: str, repo_path: str = ".", from_sha: Optional[str
 
 
 @app.post("/api/runs/{run_id}/abort")
-async def abort_run(run_id: str) -> Dict[str, str]:
+async def abort_run(run_id: str) -> dict[str, str]:
     """Abort a running agent."""
     if run_id in active_agents:
         active_agents.pop(run_id)
@@ -415,11 +414,11 @@ if web_dist.exists():
         """Serve the frontend application."""
         if full_path.startswith("api/"):
             raise HTTPException(status_code=404)
-        
+
         file_path = web_dist / full_path
         if file_path.exists() and file_path.is_file():
             return FileResponse(file_path)
-        
+
         return FileResponse(web_dist / "index.html")
 
 
