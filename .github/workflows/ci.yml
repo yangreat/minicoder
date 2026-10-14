@@ -1,0 +1,77 @@
+name: CI
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  backend-test:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ["3.10", "3.11", "3.12"]
+
+    steps:
+    - uses: actions/checkout@v3
+
+    - name: Set up Python ${{ matrix.python-version }}
+      uses: actions/setup-python@v4
+      with:
+        python-version: ${{ matrix.python-version }}
+
+    - name: Install dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install -e ".[dev]"
+
+    - name: Run type checking
+      run: |
+        mypy src/minicoder --ignore-missing-imports
+
+    - name: Run linting
+      run: |
+        ruff check src/minicoder tests --ignore E501,F401,UP035
+
+    - name: Run tests
+      run: |
+        pytest tests/ -v --cov=minicoder --cov-report=xml --cov-report=term
+
+    - name: Upload coverage
+      uses: codecov/codecov-action@v3
+      if: matrix.python-version == '3.11'
+      with:
+        file: ./coverage.xml
+        fail_ci_if_error: false
+
+  frontend-test:
+    runs-on: ubuntu-latest
+
+    steps:
+    - uses: actions/checkout@v3
+
+    - name: Set up Node.js
+      uses: actions/setup-node@v4
+      with:
+        node-version: '20'
+
+    - name: Install frontend dependencies
+      working-directory: ./web
+      run: npm install
+
+    - name: Run ESLint
+      working-directory: ./web
+      run: npm run lint -- --max-warnings 5
+
+    - name: Run type checking
+      working-directory: ./web
+      run: npm run typecheck
+
+    - name: Run tests
+      working-directory: ./web
+      run: npm run test
+
+    - name: Build frontend
+      working-directory: ./web
+      run: npm run build
