@@ -120,3 +120,33 @@ OPENAI_API_KEY="$DASHSCOPE_API_KEY" python benchmarks/evaluate.py --model qwen3.
 - Main v3 regression: the two parallel "read" subtasks get a 3-step budget ("Max steps (3) reached"). They usually run out of steps before calling finish, so they are marked failed (even after the one retry), and the dependent "Locate the buggy code and apply the fix" subtask is BLOCKED. That means no fix is attempted. "[blocked] Locate…" appears in 24/30 qwen3.6-plus and 20/20 qwen-plus multi results, and both read subtasks failed in 22/30 and 19/20. These counts come from the merged agent messages, which may be truncated, so treat them as lower bounds. Runs end at ~12 steps (2 reads × 3 steps × 2 attempts).
 - The new transitive-BLOCKED handling works: the blocked chain now terminates instead of deadlocking.
 - Single mode on the new code matches v2 (10/10).
+
+
+---
+
+## v4 keyword planner (`57491e9`) — always-fallback finding
+
+The following is a measured DashScope eval of `57491e9` (the keyword `Planner.decompose_coding_task` on main before the repo-aware LLM planner). **Do not treat these multi rows as results for the LLM planner in later commits.** Real eval of the LLM planner will be run separately.
+
+Generated 2026-10-14 19:38 Asia/Shanghai; runs 2026-10-14 19:14–~19:38. Endpoint https://dashscope.aliyuncs.com/compatible-mode/v1, `--compression default`, `--max-steps 15`, `--protect-tests block`.
+
+Prompts: *default fix* = `Fix the bug in this repository. Read README.md for context and make all tests pass.`; *implement* = `Implement the missing/incorrect behaviour described in README.md in every module so that all tests pass.`
+
+| run | model | mode | tasks | prompt | runs | tests pass | pass rate (per repeat) | finish | fallback→single | true multi | steps | tokens | wall s |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| qwen3.6-plus_multi_default | qwen3.6-plus | multi | 10 orig | default fix | 30 | 30/30 | 100.0 ± 0.0% | 30/30 | 30/30 | 0/30 | 8.9 ± 2.5 | 18276.0 ± 7833.1 | 47.5 ± 35.5 |
+| qwen-plus_multi_default | qwen-plus | multi | 10 orig | default fix | 20 | 20/20 | 100.0 ± 0.0% | 18/20 | 20/20 | 0/20 | 10.1 ± 2.4 | 22018.0 ± 8774.5 | 53.9 ± 47.7 |
+| twofix_qwen3.6-plus_single_fixprompt | qwen3.6-plus | single | 3 twofix | default fix | 9 | 9/9 | 100.0 ± 0.0% | 9/9 | n/a | n/a | 8.1 ± 2.3 | 17165.0 ± 5811.9 | 38.1 ± 7.9 |
+| twofix_qwen3.6-plus_multi_fixprompt | qwen3.6-plus | multi | 3 twofix | default fix | 9 | 9/9 | 100.0 ± 0.0% | 9/9 | 9/9 | 0/9 | 7.4 ± 1.5 | 15972.0 ± 4739.1 | 36.5 ± 5.0 |
+| twofix_qwen3.6-plus_single_implprompt | qwen3.6-plus | single | 3 twofix | implement | 9 | 9/9 | 100.0 ± 0.0% | 9/9 | n/a | n/a | 6.6 ± 1.7 | 12638.3 ± 3483.0 | 31.1 ± 7.2 |
+| twofix_qwen3.6-plus_multi_implprompt | qwen3.6-plus | multi | 3 twofix | implement | 9 | 9/9 | 100.0 ± 0.0% | 9/9 | 0/9 | 9/9 | 13.7 ± 0.9 | 31635.2 ± 2350.8 | 70.2 ± 12.2 |
+
+### Notes (v4)
+
+- On the 10 original tasks, multi mode fell back to single in **50/50** runs (0 true-multi). The planner is keyword-based and ignores repo contents. Any prompt containing "fix"/"bug" gets [read, read] → 1 edit → verify, which has fewer than 2 independent edit subtasks, so it always falls back. The v4 multi rows on the original tasks are really single-agent numbers. The same holds for the twofix tasks under the default prompt (9/9 fallback), even though each has two independent bugs in separate modules.
+- True multi only happened when the prompt contained "implement"/"add " (fixed template: plan → [Implement the feature, Add tests for the feature] → verify): 9/9 true multi, 9/9 tests pass. Compared with single mode on the same prompt it used about 2.1× the steps (13.7 vs 6.6), 2.5× the tokens (31.6k vs 12.6k) and 2.3× the wall time (70 s vs 31 s). The two parallel edit workers come from a fixed template (feature vs tests), not one per bug/module. Under `--protect-tests block`, the "Add tests" worker cannot usefully edit test files. Evaluate.py previously truncated `agent_message` to 500 chars, hiding per-worker breakdown.
+- Two qwen-plus failures with tests still passing: `text_stats` r2 ended "failed" with `Expecting ',' delimiter: line 1 column 210` (malformed tool-call JSON aborted the run); `todo_store` r1 hit max steps (15) without calling finish.
+
+### What later commits change (not yet re-measured)
+
+Later code on this line replaces the keyword planner with a repo-aware LLM planner (exploration → schema-validated JSON edit subtasks), scopes workers to files/failing tests, adds file-level locks, runs the full suite after merge with a single-agent repair pass, returns malformed tool JSON to the model as a tool error, and records true-multi / per-worker stats in `results.json`. **No new DashScope numbers are invented here.**

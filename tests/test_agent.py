@@ -109,3 +109,60 @@ async def test_agent_resume(tmp_path: Path) -> None:
 
     finally:
         await state_manager.close()
+
+
+@pytest.mark.asyncio
+async def test_malformed_tool_args_are_returned_as_tool_error(tmp_path: Path) -> None:
+    """Invalid tool-call JSON must not abort the run; the model can retry."""
+    db_path = tmp_path / "test.db"
+    state_manager = StateManager(db_path)
+    await state_manager.initialize()
+    try:
+        responses = [
+            MockResponse(
+                tool_calls=[
+                    MockToolCall(
+                        id="call_bad",
+                        function_name="write_file",
+                        arguments='{"path": "hello.txt", "content": "oops"',
+                    )
+                ]
+            ),
+            MockResponse(
+                tool_calls=[
+                    MockToolCall(
+                        id="call_ok",
+                        function_name="write_file",
+                        arguments=json.dumps(
+                            {"path": "hello.txt", "content": "Hello, World!"}
+                        ),
+                    )
+                ]
+            ),
+            MockResponse(
+                tool_calls=[
+                    MockToolCall(
+                        id="call_fin",
+                        function_name="finish",
+                        arguments=json.dumps({"message": "recovered"}),
+                    )
+                ]
+            ),
+        ]
+        agent = CodingAgent(tmp_path, state_manager, max_steps=10)
+        agent.client = MockOpenAI(responses)
+        result = await agent.run("Create a hello.txt file")
+        assert result["status"] == "success", result.get("message")
+        assert (tmp_path / "hello.txt").read_text() == "Hello, World!"
+        events = await state_manager.get_events(result["run_id"])
+        tool_results = [
+            e.data.get("result") for e in events if e.event_type.value == "tool_result"
+        ]
+        assert any(
+            isinstance(r, dict)
+            and r.get("success") is False
+            and "Invalid JSON" in str(r.get("error") or "")
+            for r in tool_results
+        )
+    finally:
+        await state_manager.close()
